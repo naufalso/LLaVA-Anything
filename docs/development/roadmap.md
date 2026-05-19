@@ -347,16 +347,16 @@ Candidate vision models:
 
 Tasks:
 
-- Add fixture that creates and saves a tiny text model.
-- Add fixture that creates and saves a tiny vision model.
-- Add fixture that creates tokenizer/image processor artifacts.
-- Run builder against local file paths.
-- Test full save/load/generate.
+- Add fixture that creates and saves a tiny text model. Done.
+- Add fixture that creates and saves a tiny vision model. Done.
+- Add fixture that creates tokenizer/image processor artifacts. Done.
+- Run builder against local file paths. Done.
+- Test full save/load/generate. Done.
 
 Exit criteria:
 
 - CI can verify the core composition flow without GPU and without downloading
-  giant models.
+  giant models. Done with local tiny generated components.
 
 ## Milestone 5 - Training Data Path
 
