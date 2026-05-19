@@ -35,9 +35,13 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+wandb = [
+    "wandb>=0.17",
+]
 
 [project.scripts]
 llava-anything-build = "llava_anything.builder:main"
+llava-anything-pretrain = "llava_anything.training:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

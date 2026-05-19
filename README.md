@@ -81,6 +81,37 @@ with torch.inference_mode():
 print(processor.decode(output[0], skip_special_tokens=True))
 ```
 
+## Stage-1 Projector Pretraining
+
+Stage-1 follows the LLaVA feature-alignment setup: the language model and
+vision tower are frozen, and only `multi_modal_projector` is trained. The
+training configuration is separate from the model YAML:
+
+```bash
+uv run llava-anything-pretrain examples/qwen3_1_7b_clip_base_pretrain.yaml
+```
+
+The provided example expects LLaVA-Pretrain annotations at
+`data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json` and images under
+`data/LLaVA-Pretrain`. It uses `examples/qwen3_1_7b_clip_base.yaml`, bfloat16,
+and projector-only training. Set `training.bf16: false` and remove
+`model_kwargs.torch_dtype` if you are doing a tiny CPU-only smoke.
+
+Set `logging.preview_samples` to print rendered prompt/target examples before
+training starts. Weights & Biases is optional and only activates when the
+training YAML defines a top-level `wandb:` block:
+
+```bash
+uv pip install -e ".[dev,wandb]"
+```
+
+```yaml
+wandb:
+  project: llava-anything
+  name: qwen3-1.7b-clip-base-pretrain-projector
+  mode: offline
+```
+
 ## Validation Scripts
 
 Load real YAML components on a GPU machine:

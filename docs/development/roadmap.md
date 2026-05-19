@@ -365,24 +365,24 @@ data.
 
 Tasks:
 
-- Define training YAML schema separately from model YAML.
-- Add dataset reader for LLaVA conversation JSON.
-- Add image loading and preprocessing path.
-- Add label masking for user tokens and image tokens.
-- Add collator for variable-length image-expanded prompts.
-- Add minimal `Trainer`/`SFTTrainer` entry point.
+- Define training YAML schema separately from model YAML. Done for stage-1 projector pretraining.
+- Add dataset reader for LLaVA conversation JSON. Done for JSON/JSONL LLaVA-style records.
+- Add image loading and preprocessing path. Done for single-image records.
+- Add label masking for user tokens and image tokens. Done for assistant-only loss.
+- Add collator for variable-length image-expanded prompts. Done.
+- Add minimal `Trainer`/`SFTTrainer` entry point. Done with `Trainer` via `llava-anything-pretrain`.
 - Support trainable module selection:
-  - projector only
-  - projector + vision tower
-  - projector + LoRA on language model
-  - full fine-tune
-- Add PEFT dependency only as optional extra if used.
+  - projector only. Done.
+  - projector + vision tower. Basic selection supported; full validation pending.
+  - projector + LoRA on language model. Pending optional PEFT work.
+  - full fine-tune. Basic selection supported; full validation pending.
+- Add PEFT dependency only as optional extra if used. Pending.
 
 Exit criteria:
 
-- A tiny synthetic image-text dataset can overfit on a tiny model.
-- Projector-only training runs end to end.
-- Loss decreases on the synthetic task.
+- A tiny synthetic image-text dataset can overfit on a tiny model. Initial decreasing-loss smoke done.
+- Projector-only training runs end to end. Done on tiny generated components.
+- Loss decreases on the synthetic task. Done.
 
 ## Milestone 6 - Projector And Adapter Improvements
 
