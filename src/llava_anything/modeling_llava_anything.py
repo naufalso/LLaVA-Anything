@@ -32,6 +32,14 @@ class LlavaAnythingCausalLMOutputWithPast(ModelOutput):
     image_hidden_states: torch.FloatTensor | None = None
 
 
+def _default_return_dict_from_config(config: Any) -> bool:
+    missing = object()
+    return_dict = getattr(config, "return_dict", missing)
+    if return_dict is not missing:
+        return bool(return_dict)
+    return bool(getattr(config, "use_return_dict"))
+
+
 class IdentityProjector(nn.Module):
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         return image_features
@@ -280,7 +288,7 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         return_dict: bool | None = None,
         **kwargs: Any,
     ) -> tuple | LlavaAnythingCausalLMOutputWithPast:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else _default_return_dict_from_config(self.config)
         if kwargs.get("logits_to_keep", 0) is None:
             kwargs.pop("logits_to_keep")
         image_hidden_states = None

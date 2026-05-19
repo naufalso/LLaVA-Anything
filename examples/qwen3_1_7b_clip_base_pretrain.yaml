@@ -13,7 +13,7 @@ logging:
 training:
   output_dir: checkpoints/qwen3-1.7b-clip-base-pretrain-projector
   trainable_modules: projector
-  per_device_train_batch_size: 4
+  per_device_train_batch_size: 16
   gradient_accumulation_steps: 16
   num_train_epochs: 1
   learning_rate: 1.0e-3

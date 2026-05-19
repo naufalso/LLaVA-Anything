@@ -4,6 +4,7 @@ import torch
 from transformers import AutoModelForImageTextToText, CLIPVisionConfig, LlamaConfig
 
 from llava_anything import LlavaAnythingConfig, LlavaAnythingForConditionalGeneration
+from llava_anything.modeling_llava_anything import _default_return_dict_from_config
 
 
 def tiny_config() -> LlavaAnythingConfig:
@@ -57,6 +58,40 @@ def test_forward_replaces_image_placeholders() -> None:
 
     assert outputs.logits.shape == (1, 6, 64)
     assert outputs.image_hidden_states.shape == (1, 4, 16)
+
+
+def test_default_return_dict_prefers_modern_config_attribute() -> None:
+    class ModernConfig:
+        return_dict = False
+
+        @property
+        def use_return_dict(self) -> bool:
+            raise AssertionError("deprecated use_return_dict should not be read")
+
+    assert _default_return_dict_from_config(ModernConfig()) is False
+
+
+def test_default_return_dict_falls_back_to_legacy_config_attribute() -> None:
+    class LegacyConfig:
+        @property
+        def use_return_dict(self) -> bool:
+            return True
+
+    assert _default_return_dict_from_config(LegacyConfig()) is True
+
+
+def test_forward_prefers_return_dict_over_deprecated_use_return_dict(monkeypatch) -> None:
+    model = LlavaAnythingForConditionalGeneration(tiny_config())
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    def fail_on_use_return_dict(_config: LlavaAnythingConfig) -> bool:
+        raise AssertionError("deprecated use_return_dict should not be read")
+
+    monkeypatch.setattr(type(model.config), "use_return_dict", property(fail_on_use_return_dict))
+
+    outputs = model(input_ids=input_ids)
+
+    assert outputs.logits.shape == (1, 3, 64)
 
 
 def test_forward_validates_image_token_count() -> None:
