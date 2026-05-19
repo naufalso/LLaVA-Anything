@@ -112,6 +112,8 @@ def processor_from_yaml_dict(data: dict[str, Any], config: LlavaAnythingConfig) 
     tokenizer = AutoTokenizer.from_pretrained(text_section["name_or_path"], **tokenizer_kwargs)
     if tokenizer_section.get("padding_side") is not None:
         tokenizer.padding_side = tokenizer_section["padding_side"]
+    if tokenizer_section.get("model_max_length") is not None:
+        tokenizer.model_max_length = int(tokenizer_section["model_max_length"])
 
     if not _token_in_vocab(tokenizer, config.image_token):
         additional_special_tokens = list(getattr(tokenizer, "additional_special_tokens", []) or [])
@@ -119,8 +121,7 @@ def processor_from_yaml_dict(data: dict[str, Any], config: LlavaAnythingConfig) 
             additional_special_tokens.append(config.image_token)
         tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
     config.image_token_index = int(tokenizer.convert_tokens_to_ids(config.image_token))
-    config.text_config.vocab_size = len(tokenizer)
-    config.vocab_size = len(tokenizer)
+    config.vocab_size = int(getattr(config.text_config, "vocab_size", len(tokenizer)) or len(tokenizer))
 
     image_processor = AutoImageProcessor.from_pretrained(
         vision_section["name_or_path"],
@@ -194,10 +195,16 @@ def save_from_yaml(
             load_pretrained_components=True,
             model_kwargs=model_kwargs,
         )
-        if len(processor.tokenizer) != model.get_input_embeddings().num_embeddings:
-            model.resize_token_embeddings(len(processor.tokenizer))
-            model.config.text_config.vocab_size = len(processor.tokenizer)
-            model.config.vocab_size = len(processor.tokenizer)
+        tokenizer_vocab_size = len(processor.tokenizer)
+        embedding_vocab_size = model.get_input_embeddings().num_embeddings
+        if tokenizer_vocab_size > embedding_vocab_size:
+            try:
+                model.resize_token_embeddings(tokenizer_vocab_size, mean_resizing=False)
+            except TypeError:
+                model.resize_token_embeddings(tokenizer_vocab_size)
+            resized_vocab_size = model.get_input_embeddings().num_embeddings
+            model.config.text_config.vocab_size = resized_vocab_size
+            model.config.vocab_size = resized_vocab_size
         model.save_pretrained(output)
 
 

@@ -103,6 +103,14 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
             self.multi_modal_projector.apply(self._init_weights)
             nn.init.normal_(self.image_newline, mean=0.0, std=embed_std)
 
+    @property
+    def device(self) -> torch.device:
+        return self.get_input_embeddings().weight.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.get_input_embeddings().weight.dtype
+
     @classmethod
     def from_pretrained_components(
         cls,
@@ -140,6 +148,16 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
             trust_remote_code=config.text_trust_remote_code,
             **text_model_kwargs,
         )
+        embedding_vocab_size = language_model.get_input_embeddings().num_embeddings
+        required_vocab_size = max(int(config.image_token_index) + 1, int(getattr(config, "vocab_size", 0) or 0))
+        if required_vocab_size > embedding_vocab_size:
+            try:
+                language_model.resize_token_embeddings(required_vocab_size, mean_resizing=False)
+            except TypeError:
+                language_model.resize_token_embeddings(required_vocab_size)
+            resized_vocab_size = language_model.get_input_embeddings().num_embeddings
+            config.text_config.vocab_size = resized_vocab_size
+            config.vocab_size = resized_vocab_size
         vision_tower = AutoModel.from_pretrained(
             vision_model_name_or_path,
             config=config.vision_config,
@@ -204,15 +222,21 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         elif pixel_values.dim() != 4:
             raise ValueError(f"pixel_values must be 4D or 5D, got shape {tuple(pixel_values.shape)}")
 
+        vision_parameter = next(self.vision_tower.parameters())
         vision_outputs = self.vision_tower(
-            pixel_values.to(device=self.device, dtype=self.dtype),
+            pixel_values.to(device=vision_parameter.device, dtype=vision_parameter.dtype),
             output_hidden_states=True,
             return_dict=True,
             **kwargs,
         )
         selected = self._select_vision_features(vision_outputs)
+        projector_parameter = next(iter(self.multi_modal_projector.parameters()), None)
+        if projector_parameter is not None and (
+            projector_parameter.device != selected.device or projector_parameter.dtype != selected.dtype
+        ):
+            self.multi_modal_projector.to(device=selected.device, dtype=selected.dtype)
         image_features = self.multi_modal_projector(selected)
-        return image_features.to(dtype=self.get_input_embeddings().weight.dtype)
+        return image_features.to(device=self.device, dtype=self.dtype)
 
     def _merge_input_ids_with_image_features(
         self,

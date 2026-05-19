@@ -9,9 +9,10 @@ vision encoder, multimodal projector, processor behavior, and training settings,
 then get a unified model that works with Hugging Face Auto APIs and familiar
 image-text inference patterns.
 
-The current implementation is an MVP package skeleton. It proves the public
-shape of the package, but it has not yet been validated on real GPU hardware
-with full 8B-class models or trained projector weights.
+The current implementation is an MVP HF-native package that has passed local
+unit tests plus NVIDIA GPU runtime smokes for Apertus/SigLIP and a lower-memory
+Qwen3/CLIP-base combination. The projector is still randomly initialized, so
+image-text generation is a runtime/API check rather than a quality signal.
 
 ## Product Goals
 
@@ -49,26 +50,81 @@ Implemented:
 - Example YAML files:
   - `examples/qwen3_clip.yaml`
   - `examples/apertus_siglip.yaml`
-- Unit tests and local CPU smoke tests.
+  - `examples/qwen3_1_7b_clip_base.yaml` for lower-memory GPU smoke tests
+- Tokenizer YAML options including `padding_side` and `model_max_length`.
+- Unit and smoke regression tests for:
+  - config serialization
+  - image-token expansion
+  - image-token/image-feature mismatch errors
+  - `generate()` with tiny image inputs
+  - tokenizer vocab handling for pretrained checkpoints with reserved vocab rows
+  - wrapper device/dtype behavior under dispatched pretrained components
+  - runtime metadata dependencies needed for GPU validation
 - Architecture decision record:
   - `docs/architecture/adr-001-hf-native-composition.md`
-- Handoff:
-  - `docs/development/handoff-2026-05-19.md`
 
-Verified locally:
+Verified on NVIDIA GPU, May 19, 2026:
 
-- `uv run --extra dev pytest -q`
-- YAML artifact build for Qwen3 + CLIP.
-- Auto API smoke tests with tiny in-memory model configs.
-- `generate()` with tiny image inputs.
+- Environment:
+  - GPU: NVIDIA GeForce RTX 4090, 24 GiB VRAM
+  - NVIDIA driver: `535.288.01`
+  - PyTorch: `2.6.0+cu124`
+  - CUDA runtime reported by PyTorch: `12.4`
+  - Transformers: `5.8.1`
+  - Accelerate: `1.13.0`
+- `uv run pytest -q`: `13 passed`.
+- Config-only artifact builds for:
+  - `examples/qwen3_clip.yaml`
+  - `examples/apertus_siglip.yaml`
+  - `examples/qwen3_1_7b_clip_base.yaml`
+- `AutoConfig.from_pretrained(...)`.
+- `AutoProcessor.from_pretrained(...)`.
+- `AutoModelForImageTextToText.from_config(...)`.
+- Full pretrained component loading with `torch_dtype=torch.bfloat16` and
+  `device_map="auto"` for:
+  - `swiss-ai/Apertus-8B-Instruct-2509` + `google/siglip-so400m-patch14-384`
+  - `Qwen/Qwen3-1.7B` + `openai/clip-vit-base-patch32`
+- Minimal local image-text `generate(max_new_tokens=8)` smoke tests for:
+  - Apertus + SigLIP
+  - Qwen3-1.7B + CLIP-base
 
-Not verified yet:
+Issues found during GPU validation and fixed:
 
-- Real Qwen3-8B + CLIP component loading on NVIDIA.
-- Real Apertus-8B-Instruct-2509 + SigLIP component loading on NVIDIA.
-- Pipeline compatibility.
-- Full model save/load with actual component weights.
-- Training.
+- `device_map="auto"` requires `accelerate`; added it as a runtime dependency.
+- Plain `torch>=2.2` allowed incompatible/newer CUDA wheels and too-old
+  `torch.load` behavior for Transformers 5.8; constrained runtime metadata to
+  Python `>=3.10,<3.13`, `torch>=2.6,<2.7`, and `torchvision>=0.21,<0.22`.
+- Processor construction was shrinking or growing pretrained text vocab metadata
+  before checkpoint loading; it now preserves checkpoint vocab size and lets model
+  loading resize embeddings only when required by the added image token.
+- Wrapper `device`/`dtype` followed CPU-only wrapper parameters instead of the
+  dispatched language model; it now follows the language input embeddings.
+- Image feature extraction now sends image tensors through the vision tower
+  device/dtype and returns projected features on the language embedding device.
+- Added-image-token embedding resize now runs before loading the vision tower and
+  disables memory-heavy mean resizing, avoiding unnecessary CUDA OOM on 24 GiB
+  cards.
+
+Known validation notes:
+
+- `Qwen/Qwen3-8B` + `openai/clip-vit-large-patch14-336` was started but not
+  completed because unauthenticated HF Hub shard downloads were too slow for the
+  session. The lower-memory Qwen3-1.7B + CLIP-base path validates the same
+  runtime API path.
+- `HF_HUB_DISABLE_XET=1` was useful on this machine to avoid stalled Xet-backed
+  downloads.
+- Apertus emits an optional xIELU warning when the custom CUDA kernel is not
+  installed; it falls back successfully.
+- Projector weights are still randomly initialized, so generated text is only an
+  API/runtime smoke and not a quality signal.
+
+Still not verified:
+
+- `pipeline("image-text-to-text")` compatibility.
+- Full composed model save/load with actual component weights.
+- `AutoModelForImageTextToText.from_pretrained(...)` from saved full weights.
+- Full Qwen3-8B + CLIP-large load/generate after model shards are locally cached.
+- Training or fine-tuning.
 
 ## Architecture Direction
 
@@ -119,32 +175,39 @@ Exit criteria:
 
 ## Milestone 1 - NVIDIA GPU Runtime Validation
 
+Status: mostly complete. Apertus/SigLIP and the lower-memory Qwen3/CLIP-base
+smoke path pass on a 24 GiB RTX 4090. Full Qwen3-8B + CLIP-large still needs a
+rerun after weights are cached or on a faster/authenticated HF Hub connection.
+
 Goal: prove the package can instantiate real first-version target components on
 NVIDIA hardware.
 
 Targets:
 
 - `Qwen/Qwen3-8B` + `openai/clip-vit-large-patch14-336`
+- `Qwen/Qwen3-1.7B` + `openai/clip-vit-base-patch32`
 - `swiss-ai/Apertus-8B-Instruct-2509` + `google/siglip-so400m-patch14-384`
 
-Tasks:
+Completed tasks:
 
-- Capture environment info:
-  - OS
-  - GPU model and VRAM
-  - NVIDIA driver
-  - CUDA runtime
-  - PyTorch version
-  - Transformers version
-  - Accelerate version
-- Run unit tests.
-- Build YAML artifacts without weights.
-- Load full pretrained components with:
+- Captured GPU, driver, CUDA runtime, PyTorch, Transformers, and Accelerate
+  versions.
+- Ran unit tests.
+- Built YAML artifacts without weights.
+- Loaded full pretrained components with:
   - `torch_dtype=torch.bfloat16`
   - `device_map="auto"`
-- Check actual class names for language and vision components.
-- Run one forward pass with a real image and prompt.
-- Run `generate()` with `max_new_tokens=8` first, then longer if stable.
+- Checked actual class names for language and vision components.
+- Ran short local-image `generate()` smoke tests for Apertus/SigLIP and
+  Qwen3-1.7B/CLIP-base.
+- Converted GPU validation failures into regression tests where practical.
+
+Remaining tasks:
+
+- Complete full Qwen3-8B + CLIP-large loading and generation after weights are
+  cached.
+- Add a committed validation script instead of relying on one-off `/tmp` scripts.
+- Run a longer generation smoke after projector/adaptor weights exist.
 
 Validation script outline:
 
@@ -167,18 +230,31 @@ print(model.hf_device_map if hasattr(model, "hf_device_map") else "no device map
 
 Exit criteria:
 
-- Both first-version target configs load their text and vision components.
-- No dtype/device mismatch during forward.
-- No image-token/image-feature mismatch for standard image sizes.
-- Any failures are captured with stack traces and converted into tests.
+- Apertus/SigLIP loads text and vision components on NVIDIA. Done.
+- Qwen3-1.7B/CLIP-base loads text and vision components on NVIDIA. Done.
+- Qwen3-8B/CLIP-large loads text and vision components on NVIDIA. Pending
+  cached weights or faster/authenticated download.
+- No dtype/device mismatch during forward or short generation. Done for tested
+  combos.
+- No image-token/image-feature mismatch for standard image sizes. Done for
+  tested combos.
+- Any failures are captured with stack traces and converted into tests where
+  practical. Done for dependency, vocab, resize, and wrapper device/dtype bugs.
 
-Likely risks:
+Resolved risks:
 
-- `device_map="auto"` may not move the custom wrapper the same way it moves the
-  nested models.
-- `model.device` may be insufficient for multi-GPU dispatch.
-- Qwen3 and Apertus may differ in generation kwargs expectations.
-- SigLIP may return a different hidden-state shape than CLIP in some variants.
+- `device_map="auto"` does not move CPU-only wrapper parameters, so wrapper
+  `device`/`dtype` now follow the language input embeddings.
+- Processor vocab mutation before checkpoint loading broke Qwen3 and Apertus;
+  checkpoint vocab is now preserved until after pretrained weights load.
+- Adding a new image token to Apertus required embedding resize; resize now runs
+  before loading the vision tower and disables memory-heavy mean resizing.
+
+Remaining risks:
+
+- Multi-GPU dispatch still needs explicit validation.
+- Qwen3-8B + CLIP-large still needs full validation after weights are cached.
+- Pipeline compatibility is still unknown.
 
 ## Milestone 2 - Processor And Pipeline Compatibility
 
@@ -458,6 +534,7 @@ text_model:
   trust_remote_code: false
   tokenizer:
     padding_side: left
+    model_max_length: 1024
 
 vision_model:
   name_or_path: openai/clip-vit-large-patch14-336
@@ -504,8 +581,9 @@ Track each tested model combination in a table like this:
 
 | Text model | Vision model | Config build | Component load | Forward | Generate | Pipeline | Save/load | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen/Qwen3-8B | openai/clip-vit-large-patch14-336 | Pending GPU | Pending GPU | Pending GPU | Pending GPU | Pending GPU | Pending GPU | First target |
-| swiss-ai/Apertus-8B-Instruct-2509 | google/siglip-so400m-patch14-384 | Pending GPU | Pending GPU | Pending GPU | Pending GPU | Pending GPU | Pending GPU | First target |
+| Qwen/Qwen3-8B | openai/clip-vit-large-patch14-336 | Pass | Download-bound | Not run | Not run | Pending | Pending | First target; shard fetch was too slow unauthenticated during validation session |
+| Qwen/Qwen3-1.7B | openai/clip-vit-base-patch32 | Pass | Pass | Pass via generate prefill | Pass | Pending | Pending | Lower-memory Qwen runtime smoke; used `HF_HUB_DISABLE_XET=1` |
+| swiss-ai/Apertus-8B-Instruct-2509 | google/siglip-so400m-patch14-384 | Pass | Pass | Pass via generate prefill | Pass | Pending | Pending | First target; optional xIELU kernel warning is non-fatal |
 
 Update this matrix after every serious compatibility test.
 
@@ -554,6 +632,8 @@ Troubleshooting should include:
 - image token count mismatch
 - CUDA out of memory
 - `device_map` dispatch issues
+- missing `accelerate` for `device_map="auto"`
+- incompatible PyTorch/CUDA wheel for the installed NVIDIA driver
 - missing `torchvision`
 - tokenizer has no pad token
 - chat template issues
@@ -596,15 +676,17 @@ Use this prompt when continuing elsewhere:
 You are continuing LLaVa-Anything development.
 
 Read these first:
-- docs/development/handoff-2026-05-19.md
 - docs/development/roadmap.md
 - docs/architecture/adr-001-hf-native-composition.md
 
-Current phase: NVIDIA GPU validation and first real-model integration.
+Current phase: processor/pipeline compatibility and full saved-model workflow.
+NVIDIA GPU validation on May 19, 2026 passed for Apertus/SigLIP and
+Qwen3-1.7B/CLIP-base. Full Qwen3-8B/CLIP-large still needs a rerun after model
+weights are cached or with an authenticated/faster HF Hub connection.
 
 Use uv by default. Do not modify or include LLaVA-NeXT; it is reference-only.
 Keep the public names llava-anything, llava_anything, llava_anything model_type,
-and LlavaAnything* classes.
+and LlavaAnything* classes. Do not reintroduce llava_everything names.
 
 Start by running:
 uv venv .venv
@@ -612,9 +694,12 @@ uv pip install -e ".[dev]"
 uv run pytest -q
 uv run llava-anything-build examples/qwen3_clip.yaml --output-dir checkpoints/qwen3-clip-config
 uv run llava-anything-build examples/apertus_siglip.yaml --output-dir checkpoints/apertus-siglip-config
+uv run llava-anything-build examples/qwen3_1_7b_clip_base.yaml --output-dir checkpoints/qwen3-1.7b-clip-base-config
 
-Then validate full pretrained component loading on NVIDIA with bfloat16 and
-device_map="auto" for both example YAML files. Capture environment info,
-commands, failures, and fixes. Convert failures into tests where practical.
+Recommended next work:
+1. Validate `pipeline("image-text-to-text")` compatibility.
+2. Implement and test full composed model save/load with actual component weights.
+3. Add committed GPU validation and inference smoke scripts instead of relying on
+   one-off `/tmp` scripts.
+4. Rerun Qwen3-8B/CLIP-large once weights are available locally.
 ```
-
