@@ -3,7 +3,7 @@ from __future__ import annotations
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import PreTrainedTokenizerFast
+from transformers import AutoProcessor, CLIPImageProcessor, PreTrainedTokenizerFast
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
 
@@ -94,6 +94,52 @@ def test_processor_builder_does_not_grow_pretrained_vocab_before_weight_load(mon
     assert config.image_token_index == 3
     assert config.text_config.vocab_size == 3
     assert config.vocab_size == 3
+
+
+def test_auto_processor_reloads_saved_processor(tmp_path) -> None:
+    processor = LlavaAnythingProcessor(
+        image_processor=CLIPImageProcessor(size={"height": 8, "width": 8}, crop_size={"height": 8, "width": 8}),
+        tokenizer=tokenizer(),
+        image_token="<image>",
+        image_seq_length=4,
+        patch_size=4,
+    )
+    processor.save_pretrained(tmp_path)
+    tiny_config().save_pretrained(tmp_path)
+
+    reloaded = AutoProcessor.from_pretrained(tmp_path)
+
+    assert isinstance(reloaded, LlavaAnythingProcessor)
+    assert reloaded.image_token == "<image>"
+    assert reloaded.image_seq_length == 4
+
+
+def test_processor_post_process_image_text_to_text_decodes_tokens() -> None:
+    processor = LlavaAnythingProcessor(
+        image_processor=DummyImageProcessor(),
+        tokenizer=tokenizer(),
+        image_token="<image>",
+        image_seq_length=3,
+    )
+    encoded = processor.tokenizer(["hello"], return_tensors="pt")
+
+    assert processor.post_process_image_text_to_text(encoded["input_ids"]) == ["hello"]
+
+
+def test_processor_forwards_direct_text_kwargs_to_tokenizer() -> None:
+    tok = tokenizer()
+    tok.pad_token = "<unk>"
+    processor = LlavaAnythingProcessor(
+        image_processor=DummyImageProcessor(),
+        tokenizer=tok,
+        image_token="<image>",
+        image_seq_length=3,
+    )
+
+    encoded = processor(text=["hello", "hello hello"], return_tensors="pt", padding=True)
+
+    assert encoded["input_ids"].shape[0] == 2
+    assert encoded["input_ids"].shape[1] == 2
 
 
 def test_processor_builder_sets_tokenizer_model_max_length(monkeypatch) -> None:

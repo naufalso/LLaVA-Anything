@@ -60,6 +60,12 @@ Implemented:
   - tokenizer vocab handling for pretrained checkpoints with reserved vocab rows
   - wrapper device/dtype behavior under dispatched pretrained components
   - runtime metadata dependencies needed for GPU validation
+  - saved processor reload through `AutoProcessor`
+  - saved full tiny composed model reload through `AutoModelForImageTextToText`
+  - `pipeline("image-text-to-text")` dict and chat inputs with a tiny local model and processor
+- Committed validation scripts:
+  - `scripts/validate_gpu_components.py`
+  - `scripts/smoke_image_text_generation.py`
 - Architecture decision record:
   - `docs/architecture/adr-001-hf-native-composition.md`
 
@@ -120,9 +126,8 @@ Known validation notes:
 
 Still not verified:
 
-- `pipeline("image-text-to-text")` compatibility.
-- Full composed model save/load with actual component weights.
-- `AutoModelForImageTextToText.from_pretrained(...)` from saved full weights.
+- `pipeline("image-text-to-text")` compatibility for full 8B target checkpoints on GPU.
+- Full composed model save/load with actual 8B target component weights.
 - Full Qwen3-8B + CLIP-large load/generate after model shards are locally cached.
 - Training or fine-tuning.
 
@@ -264,13 +269,13 @@ Tasks:
 
 - Validate `AutoProcessor.from_pretrained(...)`.
 - Validate `AutoModelForImageTextToText.from_pretrained(...)`.
-- Validate `pipeline("image-text-to-text", model=..., processor=...)`.
+- Validate `pipeline("image-text-to-text", model=..., processor=...)`. Done for tiny local dict and chat-style inputs.
 - Confirm `apply_chat_template` works for:
   - Qwen3 chat template
   - Apertus chat template
   - no chat template fallback
 - Confirm image-token expansion counts match the model feature count.
-- Add tests for saved processor reload from temporary directories.
+- Add tests for saved processor reload from temporary directories. Done.
 - Document the expected prompt format.
 
 Validation examples:
@@ -290,7 +295,7 @@ model = AutoModelForImageTextToText.from_pretrained(
 Exit criteria:
 
 - Auto APIs work after saving config, processor, and model weights.
-- Pipeline either works or has a documented blocker with an issue/task.
+- Pipeline either works or has a documented blocker with an issue/task. Done for tiny local dict and chat-style coverage; full target GPU smokes remain.
 
 ## Milestone 3 - Full Save/Load Workflow
 
@@ -316,12 +321,12 @@ uv run llava-anything-build examples/qwen3_clip.yaml \
 - Confirm `AutoModelForImageTextToText.from_pretrained` reloads the full model.
 - Confirm additional image token additions resize language embeddings before
   saving.
-- Add tests using tiny local models to avoid 8B dependencies.
+- Add tests using tiny local models to avoid 8B dependencies. Done.
 
 Exit criteria:
 
 - A composed model can be loaded with only `AutoProcessor` and
-  `AutoModelForImageTextToText`.
+  `AutoModelForImageTextToText`. Done for tiny local components; full target GPU validation remains.
 - No direct call to `model_from_yaml_dict` is required for inference after
   saving.
 
@@ -697,9 +702,7 @@ uv run llava-anything-build examples/apertus_siglip.yaml --output-dir checkpoint
 uv run llava-anything-build examples/qwen3_1_7b_clip_base.yaml --output-dir checkpoints/qwen3-1.7b-clip-base-config
 
 Recommended next work:
-1. Validate `pipeline("image-text-to-text")` compatibility.
-2. Implement and test full composed model save/load with actual component weights.
-3. Add committed GPU validation and inference smoke scripts instead of relying on
-   one-off `/tmp` scripts.
-4. Rerun Qwen3-8B/CLIP-large once weights are available locally.
+1. Run `pipeline("image-text-to-text")` and saved-model smokes against the full GPU target artifacts.
+2. Rerun Qwen3-8B/CLIP-large once weights are available locally.
+3. Add training/fine-tuning path design once the inference contract is stable.
 ```

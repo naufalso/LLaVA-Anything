@@ -63,38 +63,88 @@ class LlavaAnythingProcessor(ProcessorMixin):
             text = text.replace(self.image_token, placeholder * count, 1)
         return text.replace(placeholder, self.image_token)
 
-    def _normalize_content(self, content: Any) -> str:
+    def _image_from_content_item(self, item: dict[str, Any]) -> Any | None:
+        for key in ("image", "url", "path"):
+            if key in item:
+                return item[key]
+        return None
+
+    def _normalize_content_and_images(self, content: Any) -> tuple[str, list[Any]]:
         if isinstance(content, str):
-            return content
+            return content, []
         if not isinstance(content, list):
-            return str(content)
+            return str(content), []
 
         parts: list[str] = []
+        images: list[Any] = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "image":
                 parts.append(self.image_token)
+                image = self._image_from_content_item(item)
+                if image is not None:
+                    images.append(image)
             elif isinstance(item, dict) and item.get("type") == "text":
                 parts.append(str(item.get("text", "")))
             else:
                 parts.append(str(item))
-        return "\n".join(part for part in parts if part)
+        return "\n".join(part for part in parts if part), images
 
-    def _normalize_conversation(self, conversation: Any) -> Any:
+    def _normalize_content(self, content: Any) -> str:
+        text, _ = self._normalize_content_and_images(content)
+        return text
+
+    def _normalize_conversation_and_images(self, conversation: Any) -> tuple[Any, list[Any]]:
         if not isinstance(conversation, list):
-            return conversation
+            return conversation, []
         normalized = []
+        images: list[Any] = []
         for message in conversation:
             if not isinstance(message, dict):
                 normalized.append(message)
                 continue
             copied = dict(message)
-            copied["content"] = self._normalize_content(copied.get("content", ""))
+            content, message_images = self._normalize_content_and_images(copied.get("content", ""))
+            copied["content"] = content
+            images.extend(message_images)
             normalized.append(copied)
+        return normalized, images
+
+    def _normalize_conversation(self, conversation: Any) -> Any:
+        normalized, _ = self._normalize_conversation_and_images(conversation)
         return normalized
 
+    def _processor_kwargs_from_chat_template_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        processor_kwargs = kwargs.pop("processor_kwargs", None) or {}
+        if not isinstance(processor_kwargs, dict):
+            raise TypeError("processor_kwargs must be a mapping when provided.")
+        return dict(processor_kwargs)
+
+    def _tokenize_chat_template_output(
+        self,
+        rendered: str,
+        images: list[Any],
+        return_tensors: str | None,
+        processor_kwargs: dict[str, Any],
+    ) -> BatchFeature:
+        image_inputs = images if images else None
+        return self(images=image_inputs, text=rendered, return_tensors=return_tensors, **processor_kwargs)
+
     def apply_chat_template(self, conversation: Any, *args: Any, **kwargs: Any) -> Any:
-        conversation = self._normalize_conversation(conversation)
+        kwargs = dict(kwargs)
+        tokenize = bool(kwargs.get("tokenize", False))
+        return_dict = bool(kwargs.get("return_dict", False))
+        return_tensors = kwargs.get("return_tensors")
+        processor_kwargs = self._processor_kwargs_from_chat_template_kwargs(kwargs)
+        conversation, images = self._normalize_conversation_and_images(conversation)
+
         if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
+            if tokenize and return_dict:
+                template_kwargs = dict(kwargs)
+                template_kwargs["tokenize"] = False
+                template_kwargs.pop("return_tensors", None)
+                template_kwargs.pop("return_dict", None)
+                rendered = self.tokenizer.apply_chat_template(conversation, *args, **template_kwargs)
+                return self._tokenize_chat_template_output(rendered, images, return_tensors, processor_kwargs)
             return self.tokenizer.apply_chat_template(conversation, *args, **kwargs)
 
         add_generation_prompt = kwargs.get("add_generation_prompt", False)
@@ -107,8 +157,10 @@ class LlavaAnythingProcessor(ProcessorMixin):
         if add_generation_prompt:
             lines.append("assistant:")
         rendered = "\n".join(lines)
-        if kwargs.get("tokenize"):
-            return self.tokenizer(rendered, return_tensors=kwargs.get("return_tensors"))
+        if tokenize:
+            if return_dict:
+                return self._tokenize_chat_template_output(rendered, images, return_tensors, processor_kwargs)
+            return self.tokenizer(rendered, return_tensors=return_tensors, **processor_kwargs.get("text_kwargs", {}))
         return rendered
 
     def __call__(
@@ -131,7 +183,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
             if isinstance(text, str):
                 text = [text]
             prompt_strings = [self._expand_image_tokens(sample) for sample in text]
-            text_kwargs = dict(kwargs.pop("text_kwargs", {}))
+            nested_text_kwargs = dict(kwargs.pop("text_kwargs", {}))
+            text_kwargs = {**kwargs, **nested_text_kwargs}
             text_inputs = self.tokenizer(prompt_strings, return_tensors=return_tensors, **text_kwargs)
 
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)

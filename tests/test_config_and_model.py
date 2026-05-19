@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from transformers import CLIPVisionConfig, LlamaConfig
+from transformers import AutoModelForImageTextToText, CLIPVisionConfig, LlamaConfig
 
 from llava_anything import LlavaAnythingConfig, LlavaAnythingForConditionalGeneration
 
@@ -88,6 +88,18 @@ def test_generate_accepts_image_inputs() -> None:
     )
 
     assert output.shape == (1, 7)
+
+
+def test_auto_model_for_image_text_to_text_reloads_saved_weights(tmp_path) -> None:
+    torch.manual_seed(0)
+    model = LlavaAnythingForConditionalGeneration(tiny_config())
+    model.save_pretrained(tmp_path)
+
+    reloaded = AutoModelForImageTextToText.from_pretrained(tmp_path)
+
+    assert isinstance(reloaded, LlavaAnythingForConditionalGeneration)
+    assert reloaded.config.model_type == "llava_anything"
+    assert reloaded.get_input_embeddings().num_embeddings == model.get_input_embeddings().num_embeddings
 
 
 def test_wrapper_dtype_tracks_language_input_embeddings() -> None:

@@ -70,6 +70,24 @@ with torch.inference_mode():
 print(processor.decode(output[0], skip_special_tokens=True))
 ```
 
+## Validation Scripts
+
+Load real YAML components on a GPU machine:
+
+```bash
+uv run python scripts/validate_gpu_components.py examples/qwen3_clip.yaml
+```
+
+Run a saved-model image-text smoke through Hugging Face Auto APIs:
+
+```bash
+uv run python scripts/smoke_image_text_generation.py checkpoints/qwen3-clip-full --image image.jpg
+```
+
+The projector starts randomly initialized unless you have trained or loaded
+projector weights, so these smokes validate runtime compatibility rather than
+answer quality.
+
 ## Status
 
 This is a first-version package skeleton. It implements the Hugging Face-native
