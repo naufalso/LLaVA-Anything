@@ -1,0 +1,22 @@
+model:
+  model_type: llava_anything
+  image_token: "<image>"
+  vision_feature_layer: -2
+  vision_feature_select_strategy: full
+  image_seq_length: 729
+  projector_type: mlp2x_gelu
+  projector_hidden_act: gelu
+
+text_model:
+  name_or_path: swiss-ai/Apertus-8B-Instruct-2509
+  trust_remote_code: false
+  tokenizer:
+    padding_side: left
+
+vision_model:
+  name_or_path: google/siglip-so400m-patch14-384
+  trust_remote_code: false
+  image_processor:
+    patch_size: 14
+    num_additional_image_tokens: 0
+
