@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import yaml
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -33,9 +35,10 @@ def _save_tiny_text_component(path, *, include_image_token: bool = True, model_v
     model.save_pretrained(path)
 
     vocab = {"<unk>": 0, "hello": 1}
-    vocab.update({f"token_{idx}": idx for idx in range(2, model_vocab_size)})
+    text_vocab_limit = model_vocab_size - 1 if include_image_token else model_vocab_size
+    vocab.update({f"token_{idx}": idx for idx in range(2, text_vocab_limit)})
     if include_image_token:
-        vocab["<image>"] = len(vocab)
+        vocab["<image>"] = model_vocab_size - 1
     raw = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
     raw.pre_tokenizer = Whitespace()
     tokenizer_kwargs = {"tokenizer_object": raw, "unk_token": "<unk>"}
@@ -128,8 +131,9 @@ def test_full_composition_saves_expected_artifact_files(tmp_path) -> None:
     assert "config.json" in saved_files
     assert "tokenizer.json" in saved_files
     assert "tokenizer_config.json" in saved_files
-    assert "preprocessor_config.json" in saved_files
     assert "processor_config.json" in saved_files
+    processor_config = json.loads((output_dir / "processor_config.json").read_text())
+    assert processor_config["image_processor"]["image_processor_type"] == "CLIPImageProcessor"
     assert {"model.safetensors", "pytorch_model.bin"} & saved_files
 
 

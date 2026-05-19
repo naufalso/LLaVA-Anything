@@ -304,7 +304,7 @@ without custom build code.
 
 Tasks:
 
-- Extend builder with a documented command for full composition:
+- Extend builder with a documented command for full composition. Done:
 
 ```bash
 uv run llava-anything-build examples/qwen3_clip.yaml \
@@ -312,15 +312,15 @@ uv run llava-anything-build examples/qwen3_clip.yaml \
   --load-pretrained-components
 ```
 
-- Verify saved files include:
+- Verify saved files include. Done for tiny local full artifacts:
   - config
   - tokenizer
-  - image processor
+  - image processor payload in `processor_config.json`
   - processor config
   - model weights
-- Confirm `AutoModelForImageTextToText.from_pretrained` reloads the full model.
+- Confirm `AutoModelForImageTextToText.from_pretrained` reloads the full model. Done for tiny local full artifacts.
 - Confirm additional image token additions resize language embeddings before
-  saving.
+  saving. Done for tiny local full artifacts.
 - Add tests using tiny local models to avoid 8B dependencies. Done.
 
 Exit criteria:
@@ -328,7 +328,7 @@ Exit criteria:
 - A composed model can be loaded with only `AutoProcessor` and
   `AutoModelForImageTextToText`. Done for tiny local components; full target GPU validation remains.
 - No direct call to `model_from_yaml_dict` is required for inference after
-  saving.
+  saving. Done for tiny local full artifacts.
 
 ## Milestone 4 - Tiny Integration Models
 

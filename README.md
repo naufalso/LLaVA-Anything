@@ -28,11 +28,22 @@ uv pip install -e ".[dev]"
 ## Build From YAML
 
 ```bash
-llava-anything-build examples/qwen3_clip.yaml --output-dir checkpoints/qwen3-clip-vlm
+uv run llava-anything-build examples/qwen3_clip.yaml --output-dir checkpoints/qwen3-clip-vlm
 ```
 
 This creates a config and processor. Pass `--load-pretrained-components` when
-you want to materialize the base LLM and vision weights locally before saving.
+you want to materialize the base LLM and vision weights locally before saving:
+
+```bash
+uv run llava-anything-build examples/qwen3_clip.yaml \
+  --output-dir checkpoints/qwen3-clip-full \
+  --load-pretrained-components
+```
+
+A full saved artifact can be reloaded with `AutoProcessor` and
+`AutoModelForImageTextToText` without calling the YAML builder at inference time.
+Transformers 5.8 stores the image processor payload inside
+`processor_config.json` for this composite processor.
 
 ## Inference Shape
 
