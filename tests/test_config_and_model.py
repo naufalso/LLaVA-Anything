@@ -88,3 +88,10 @@ def test_generate_accepts_image_inputs() -> None:
     )
 
     assert output.shape == (1, 7)
+
+
+def test_wrapper_dtype_tracks_language_input_embeddings() -> None:
+    model = LlavaAnythingForConditionalGeneration(tiny_config())
+    model.language_model.to(dtype=torch.bfloat16)
+
+    assert model.dtype == torch.bfloat16
