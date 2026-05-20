@@ -645,6 +645,14 @@ Required docs before broader sharing:
 - Adapter/projector guide.
 - Troubleshooting guide.
 
+Low-priority future data work:
+
+- Consider re-hosting the scattered Stage-1 and Stage-2 training assets as a
+  unified Hugging Face dataset mirror so users can prepare data without manual
+  multi-source downloads and archive extraction. This should wait until the
+  current training path is stable and dataset licensing/redistribution details
+  are reviewed.
+
 Troubleshooting should include:
 
 - image token count mismatch

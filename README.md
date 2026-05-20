@@ -251,6 +251,7 @@ For the detailed engineering roadmap, see
 - [ ] LLaVA-NeXT-style any-resolution image handling.
 - [ ] More documentation for custom model integration.
 - [ ] Community compatibility reports.
+- [ ] Low priority: publish a unified Hugging Face dataset mirror for training data.
 
 ## Contributing
 

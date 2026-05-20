@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 from transformers import AutoProcessor
@@ -127,16 +128,58 @@ def test_pretrain_dataset_can_filter_records_to_available_images(
         )
     )
 
-    dataset = LlavaPretrainDataset(
-        data_path=data_path,
-        image_folder=tmp_path,
-        processor=processor,
-        available_images_only=True,
-    )
+    with pytest.warns(UserWarning, match="2 images not found and skipping those"):
+        dataset = LlavaPretrainDataset(
+            data_path=data_path,
+            image_folder=tmp_path,
+            processor=processor,
+            available_images_only=True,
+        )
 
     assert len(dataset) == 1
     assert dataset.records[0]["id"] == "available"
     assert dataset[0]["pixel_values"].shape == (3, 8, 8)
+
+
+def test_pretrain_dataset_warns_and_skips_missing_images_by_default(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+    tiny_image,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    available_image = tmp_path / "available.jpg"
+    tiny_image.save(available_image)
+    data_path = tmp_path / "instruct.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "missing",
+                    "image": "missing.jpg",
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "missing"},
+                    ],
+                },
+                {
+                    "id": "available",
+                    "image": available_image.name,
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "available"},
+                    ],
+                },
+            ]
+        )
+    )
+
+    with pytest.warns(UserWarning, match="1 image not found and skipping those"):
+        dataset = LlavaPretrainDataset(data_path=data_path, image_folder=tmp_path, processor=processor)
+
+    assert len(dataset) == 1
+    assert dataset.records[0]["id"] == "available"
 
 
 def test_pretraining_from_yaml_can_resume_from_composed_checkpoint(

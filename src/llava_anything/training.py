@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -105,15 +106,22 @@ class LlavaPretrainDataset(Dataset):
         image_folder: str | Path,
         processor: LlavaAnythingProcessor,
         max_samples: int | None = None,
-        available_images_only: bool = False,
+        available_images_only: bool = True,
     ) -> None:
         self.data_path = Path(data_path)
         self.image_folder = Path(image_folder)
         self.processor = processor
         records = _load_json_records(self.data_path)
         if available_images_only:
-            records = self._filter_available_records(records, max_samples=max_samples)
-        elif max_samples is not None:
+            records, skipped_count = self._filter_available_records(records)
+            if skipped_count:
+                noun = "image" if skipped_count == 1 else "images"
+                warnings.warn(
+                    f"{skipped_count} {noun} not found and skipping those before training.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        if max_samples is not None:
             records = records[:max_samples]
         self.records = records
 
@@ -135,15 +143,15 @@ class LlavaPretrainDataset(Dataset):
     def _filter_available_records(
         self,
         records: list[dict[str, Any]],
-        max_samples: int | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], int]:
         available: list[dict[str, Any]] = []
+        skipped_count = 0
         for record in records:
             if self._record_has_available_image(record):
                 available.append(record)
-                if max_samples is not None and len(available) >= max_samples:
-                    break
-        return available
+            else:
+                skipped_count += 1
+        return available, skipped_count
 
     def _load_image(self, record: dict[str, Any]) -> Image.Image:
         image_path = self._record_image_path(record)
@@ -389,7 +397,7 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         image_folder=data_section["image_folder"],
         processor=processor,
         max_samples=data_section.get("max_samples"),
-        available_images_only=bool(data_section.get("available_images_only", False)),
+        available_images_only=bool(data_section.get("available_images_only", True)),
     )
     log_preview_samples(dataset, int(logging_section.get("preview_samples", 0)))
     collator = LlavaPretrainDataCollator(processor.tokenizer)
