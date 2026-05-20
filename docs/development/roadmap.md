@@ -51,6 +51,8 @@ Implemented:
   - `examples/qwen3_clip.yaml`
   - `examples/apertus_siglip.yaml`
   - `examples/qwen3_1_7b_clip_base.yaml` for lower-memory GPU smoke tests
+  - `examples/qwen3_1_7b_clip_base_stage2_smoke.yaml` for partial-data Stage-2 smoke tests
+  - `examples/qwen3_1_7b_clip_base_stage2_full.yaml` for full Stage-2 finetuning
 - Tokenizer YAML options including `padding_side` and `model_max_length`.
 - Unit and smoke regression tests for:
   - config serialization
@@ -66,6 +68,8 @@ Implemented:
 - Committed validation scripts:
   - `scripts/validate_gpu_components.py`
   - `scripts/smoke_image_text_generation.py`
+- Committed data preparation scripts:
+  - `scripts/download_llava_pretrain.sh`
 - Architecture decision record:
   - `docs/architecture/adr-001-hf-native-composition.md`
 
@@ -370,12 +374,15 @@ Tasks:
 - Add image loading and preprocessing path. Done for single-image records.
 - Add label masking for user tokens and image tokens. Done for assistant-only loss.
 - Add collator for variable-length image-expanded prompts. Done.
-- Add minimal `Trainer`/`SFTTrainer` entry point. Done with `Trainer` via `llava-anything-pretrain`.
+- Add minimal `Trainer`/`SFTTrainer` entry point. Done with `Trainer` via `llava-anything-train` (`llava-anything-pretrain` remains as a compatibility alias).
+- Add checkpoint-based training resume for Stage-2. Done with `model_checkpoint` training YAML.
+- Add available-image filtering for partial LLaVA-Instruct downloads. Done with `data.available_images_only`.
+- Add LLaVA-Pretrain download/extract helper. Done with `scripts/download_llava_pretrain.sh`.
 - Support trainable module selection:
   - projector only. Done.
   - projector + vision tower. Basic selection supported; full validation pending.
   - projector + LoRA on language model. Pending optional PEFT work.
-  - full fine-tune. Basic selection supported; full validation pending.
+  - full fine-tune. Stage-2 configs added; full validation pending.
 - Add PEFT dependency only as optional extra if used. Pending.
 
 Exit criteria:
@@ -383,6 +390,12 @@ Exit criteria:
 - A tiny synthetic image-text dataset can overfit on a tiny model. Initial decreasing-loss smoke done.
 - Projector-only training runs end to end. Done on tiny generated components.
 - Loss decreases on the synthetic task. Done.
+- LLaVA-Pretrain data can be prepared with one script, producing
+  `data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json` and extracted image
+  shard directories such as `data/LLaVA-Pretrain/00000/`.
+- Stage-2 can start from a Stage-1 composed checkpoint and use the
+  LLaVA-Instruct mix JSON with either available-image filtering for smoke runs
+  or the full downloaded image set for full finetuning.
 
 ## Milestone 6 - Projector And Adapter Improvements
 

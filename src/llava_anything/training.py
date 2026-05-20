@@ -1,4 +1,4 @@
-"""Stage-1 pretraining utilities for LLaVa-Anything."""
+"""Training utilities for LLaVa-Anything."""
 
 from __future__ import annotations
 
@@ -105,21 +105,48 @@ class LlavaPretrainDataset(Dataset):
         image_folder: str | Path,
         processor: LlavaAnythingProcessor,
         max_samples: int | None = None,
+        available_images_only: bool = False,
     ) -> None:
         self.data_path = Path(data_path)
         self.image_folder = Path(image_folder)
         self.processor = processor
         records = _load_json_records(self.data_path)
-        self.records = records[:max_samples] if max_samples is not None else records
+        if available_images_only:
+            records = self._filter_available_records(records, max_samples=max_samples)
+        elif max_samples is not None:
+            records = records[:max_samples]
+        self.records = records
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def _load_image(self, record: dict[str, Any]) -> Image.Image:
+    def _record_image_path(self, record: dict[str, Any]) -> Path:
         image_name = record.get("image")
         if not image_name:
             raise ValueError("Pretraining records must include an image path.")
-        image_path = self.image_folder / str(image_name)
+        return self.image_folder / str(image_name)
+
+    def _record_has_available_image(self, record: dict[str, Any]) -> bool:
+        image_name = record.get("image")
+        if not image_name:
+            return False
+        return (self.image_folder / str(image_name)).is_file()
+
+    def _filter_available_records(
+        self,
+        records: list[dict[str, Any]],
+        max_samples: int | None = None,
+    ) -> list[dict[str, Any]]:
+        available: list[dict[str, Any]] = []
+        for record in records:
+            if self._record_has_available_image(record):
+                available.append(record)
+                if max_samples is not None and len(available) >= max_samples:
+                    break
+        return available
+
+    def _load_image(self, record: dict[str, Any]) -> Image.Image:
+        image_path = self._record_image_path(record)
         return Image.open(image_path).convert("RGB")
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
@@ -234,6 +261,8 @@ def _coerce_training_arguments(training_section: dict[str, Any]) -> TrainingArgu
     kwargs.setdefault("remove_unused_columns", False)
     kwargs.setdefault("report_to", [])
     kwargs.setdefault("save_strategy", "no")
+    if kwargs.get("save_strategy") is False:
+        kwargs["save_strategy"] = "no"
     kwargs.setdefault("logging_steps", 1)
     kwargs.setdefault("disable_tqdm", True)
     if "output_dir" not in kwargs:
@@ -300,11 +329,25 @@ def _build_model_and_processor(
     return model, processor
 
 
+def _load_checkpoint_model_and_processor(
+    model_checkpoint: str | Path,
+    model_kwargs: dict[str, Any] | None = None,
+) -> tuple[LlavaAnythingForConditionalGeneration, LlavaAnythingProcessor]:
+    checkpoint = Path(model_checkpoint)
+    processor = LlavaAnythingProcessor.from_pretrained(checkpoint)
+    model = LlavaAnythingForConditionalGeneration.from_pretrained(
+        checkpoint,
+        **(_coerce_model_kwargs(model_kwargs) or {}),
+    )
+    return model, processor
+
+
 def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     data = _load_training_yaml(path)
     model_yaml = data.get("model_yaml")
-    if not model_yaml:
-        raise ValueError("model_yaml is required.")
+    model_checkpoint = data.get("model_checkpoint")
+    if bool(model_yaml) == bool(model_checkpoint):
+        raise ValueError("Exactly one of model_yaml or model_checkpoint is required.")
     data_section = data.get("data", {})
     if not isinstance(data_section, dict):
         raise ValueError("data must be a mapping.")
@@ -321,11 +364,17 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         raise ValueError("wandb must be a mapping when provided.")
     configure_wandb(training_section, wandb_section)
 
-    model, processor = _build_model_and_processor(
-        model_yaml,
-        load_pretrained_components=bool(data.get("load_pretrained_components", True)),
-        model_kwargs=data.get("model_kwargs"),
-    )
+    if model_checkpoint:
+        model, processor = _load_checkpoint_model_and_processor(
+            model_checkpoint,
+            model_kwargs=data.get("model_kwargs"),
+        )
+    else:
+        model, processor = _build_model_and_processor(
+            model_yaml,
+            load_pretrained_components=bool(data.get("load_pretrained_components", True)),
+            model_kwargs=data.get("model_kwargs"),
+        )
     model.config.use_cache = False
     if hasattr(model.language_model, "config"):
         model.language_model.config.use_cache = False
@@ -340,6 +389,7 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         image_folder=data_section["image_folder"],
         processor=processor,
         max_samples=data_section.get("max_samples"),
+        available_images_only=bool(data_section.get("available_images_only", False)),
     )
     log_preview_samples(dataset, int(logging_section.get("preview_samples", 0)))
     collator = LlavaPretrainDataCollator(processor.tokenizer)
@@ -364,7 +414,7 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run LLaVa-Anything stage-1 projector pretraining.")
+    parser = argparse.ArgumentParser(description="Run LLaVa-Anything training from a YAML config.")
     parser.add_argument("training_yaml", type=Path)
     args = parser.parse_args()
     result = run_pretraining_from_yaml(args.training_yaml)

@@ -9,3 +9,4 @@ build/
 LLaVA-NeXT/
 data/
 wandb/
+checkpoints/

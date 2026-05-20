@@ -41,6 +41,7 @@ wandb = [
 
 [project.scripts]
 llava-anything-build = "llava_anything.builder:main"
+llava-anything-train = "llava_anything.training:main"
 llava-anything-pretrain = "llava_anything.training:main"
 
 [tool.setuptools.packages.find]

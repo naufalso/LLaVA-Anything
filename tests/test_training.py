@@ -17,6 +17,7 @@ from llava_anything.training import (
     configure_wandb,
     log_preview_samples,
     run_pretraining_from_yaml,
+    _coerce_training_arguments,
 )
 
 
@@ -83,6 +84,105 @@ def test_pretrain_collator_pads_text_and_stacks_images(
     assert batch["attention_mask"].shape == batch["input_ids"].shape
     assert batch["labels"].shape == batch["input_ids"].shape
     assert batch["pixel_values"].shape == (2, 3, 8, 8)
+
+
+def test_pretrain_dataset_can_filter_records_to_available_images(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+    tiny_image,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    available_image = tmp_path / "available.jpg"
+    tiny_image.save(available_image)
+    data_path = tmp_path / "instruct.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "text-only",
+                    "conversations": [
+                        {"from": "human", "value": "What is shown?"},
+                        {"from": "gpt", "value": "no image"},
+                    ],
+                },
+                {
+                    "id": "missing",
+                    "image": "missing.jpg",
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "missing"},
+                    ],
+                },
+                {
+                    "id": "available",
+                    "image": available_image.name,
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "available"},
+                    ],
+                },
+            ]
+        )
+    )
+
+    dataset = LlavaPretrainDataset(
+        data_path=data_path,
+        image_folder=tmp_path,
+        processor=processor,
+        available_images_only=True,
+    )
+
+    assert len(dataset) == 1
+    assert dataset.records[0]["id"] == "available"
+    assert dataset[0]["pixel_values"].shape == (3, 8, 8)
+
+
+def test_pretraining_from_yaml_can_resume_from_composed_checkpoint(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+    tiny_image,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    image_path = tmp_path / "image.jpg"
+    tiny_image.save(image_path)
+    data_path = tmp_path / "stage2.json"
+    _write_pretrain_json(data_path, image_path.name)
+    output_dir = tmp_path / "stage2-trained"
+    training_yaml = tmp_path / "stage2.yaml"
+    training_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "model_checkpoint": str(tiny_full_model_dir),
+                "data": {
+                    "data_path": str(data_path),
+                    "image_folder": str(tmp_path),
+                    "available_images_only": True,
+                },
+                "training": {
+                    "output_dir": str(output_dir),
+                    "trainable_modules": "full",
+                    "max_steps": 1,
+                    "per_device_train_batch_size": 1,
+                    "learning_rate": 1.0e-5,
+                    "save_strategy": "no",
+                    "report_to": [],
+                    "remove_unused_columns": False,
+                    "seed": 0,
+                },
+            }
+        )
+    )
+
+    result = run_pretraining_from_yaml(training_yaml)
+
+    assert result.train_result.training_loss >= 0
+    assert (output_dir / "config.json").exists()
+    assert any(name.startswith("language_model.") for name in result.trainable_parameter_names)
+    assert any(name.startswith("vision_tower.") for name in result.trainable_parameter_names)
+    assert any(name.startswith("multi_modal_projector.") for name in result.trainable_parameter_names)
 
 
 def test_projector_only_freezes_language_and_vision(tiny_model_yaml_path: Path, tiny_full_model_dir: Path) -> None:
@@ -195,6 +295,18 @@ def test_preview_sample_logging_shows_rendered_input_and_expected_output(
     assert "<image>" in captured
     assert "Expected output:" in captured
     assert "hello" in captured
+
+
+def test_training_arguments_coerces_yaml_boolean_no_save_strategy(tmp_path: Path) -> None:
+    args = _coerce_training_arguments(
+        {
+            "output_dir": str(tmp_path / "out"),
+            "save_strategy": False,
+            "report_to": [],
+        }
+    )
+
+    assert args.save_strategy == "no"
 
 
 def test_configure_wandb_missing_section_is_noop(monkeypatch) -> None:

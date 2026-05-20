@@ -23,3 +23,11 @@ def test_torch_dependency_supports_safe_bin_weight_loading() -> None:
 
     assert "torch>=2.6,<2.7" in dependencies
     assert "torchvision>=0.21,<0.22" in dependencies
+
+
+def test_training_cli_has_general_command_and_legacy_alias() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    scripts = pyproject["project"]["scripts"]
+
+    assert scripts["llava-anything-train"] == "llava_anything.training:main"
+    assert scripts["llava-anything-pretrain"] == "llava_anything.training:main"
