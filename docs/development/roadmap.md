@@ -11,8 +11,9 @@ image-text inference patterns.
 
 The current implementation is an MVP HF-native package that has passed local
 unit tests plus NVIDIA GPU runtime smokes for Apertus/SigLIP and a lower-memory
-Qwen3/CLIP-base combination. The projector is still randomly initialized, so
-image-text generation is a runtime/API check rather than a quality signal.
+Qwen3/CLIP-base combination. Stage-1 projector pretraining and Stage-2 full
+model finetuning are implemented, with full Stage-2 finetuning completed and
+tested on `qwen3-1.7b-clip-base`.
 
 ## Product Goals
 
@@ -70,6 +71,8 @@ Implemented:
   - `scripts/smoke_image_text_generation.py`
 - Committed data preparation scripts:
   - `scripts/download_llava_pretrain.sh`
+- Stage-2 full model finetuning completed and tested with
+  `examples/qwen3_1_7b_clip_base_stage2_full.yaml` on `qwen3-1.7b-clip-base`.
 - Architecture decision record:
   - `docs/architecture/adr-001-hf-native-composition.md`
 
@@ -125,15 +128,16 @@ Known validation notes:
   downloads.
 - Apertus emits an optional xIELU warning when the custom CUDA kernel is not
   installed; it falls back successfully.
-- Projector weights are still randomly initialized, so generated text is only an
-  API/runtime smoke and not a quality signal.
+- The May 19 GPU runtime smokes used randomly initialized projector weights, so
+  those generated texts were API/runtime checks rather than quality signals.
 
 Still not verified:
 
 - `pipeline("image-text-to-text")` compatibility for full 8B target checkpoints on GPU.
 - Full composed model save/load with actual 8B target component weights.
 - Full Qwen3-8B + CLIP-large load/generate after model shards are locally cached.
-- Training or fine-tuning.
+- Broader training and fine-tuning validation across additional model and vision
+  tower combinations.
 
 ## Architecture Direction
 
@@ -382,7 +386,7 @@ Tasks:
   - projector only. Done.
   - projector + vision tower. Basic selection supported; full validation pending.
   - projector + LoRA on language model. Pending optional PEFT work.
-  - full fine-tune. Stage-2 configs added; full validation pending.
+  - full fine-tune. Done and tested on `qwen3-1.7b-clip-base`.
 - Add PEFT dependency only as optional extra if used. Pending.
 
 Exit criteria:
@@ -395,7 +399,8 @@ Exit criteria:
   shard directories such as `data/LLaVA-Pretrain/00000/`.
 - Stage-2 can start from a Stage-1 composed checkpoint and use the
   LLaVA-Instruct mix JSON with either available-image filtering for smoke runs
-  or the full downloaded image set for full finetuning.
+  or the full downloaded image set for full finetuning. Done and tested on
+  `qwen3-1.7b-clip-base`.
 
 ## Milestone 6 - Projector And Adapter Improvements
 
@@ -725,5 +730,5 @@ uv run llava-anything-build examples/qwen3_1_7b_clip_base.yaml --output-dir chec
 Recommended next work:
 1. Run `pipeline("image-text-to-text")` and saved-model smokes against the full GPU target artifacts.
 2. Rerun Qwen3-8B/CLIP-large once weights are available locally.
-3. Add training/fine-tuning path design once the inference contract is stable.
+3. Broaden Stage-2 training validation beyond `qwen3-1.7b-clip-base`.
 ```

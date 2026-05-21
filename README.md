@@ -35,6 +35,7 @@ training before expanding into broader model support.
   `AutoModelForImageTextToText` loading.
 - CLIP and SigLIP-style vision towers.
 - Stage-1 projector pretraining with frozen LLM and vision tower.
+- Stage-2 full model finetuning.
 - Validation scripts for component loading and image-text smoke tests.
 
 Initial target LLMs:
@@ -172,6 +173,9 @@ Stage-2 starts from the Stage-1 projector checkpoint and finetunes the full
 composed model on LLaVA-Instruct data. The dataset is not included in this repo,
 so prepare the instruction JSON and images before running Stage-2.
 
+Stage-2 full finetuning has been completed and tested with
+`examples/qwen3_1_7b_clip_base_stage2_full.yaml` on `qwen3-1.7b-clip-base`.
+
 The Stage-2 configs expect this layout:
 
 ```text
@@ -244,10 +248,10 @@ For the detailed engineering roadmap, see
 - [x] Hugging Face Auto API save/load support.
 - [x] CLIP and SigLIP-style vision tower support.
 - [x] Stage-1 projector pretraining.
+- [x] Stage-2 full model finetuning, tested on `qwen3-1.7b-clip-base`.
 - [x] Basic validation and smoke-test scripts.
 - [ ] Broader validation across more LLMs and vision towers.
 - [ ] More ready-to-run example configs.
-- [ ] Stage-2 full model finetuning.
 - [ ] LLaVA-NeXT-style any-resolution image handling.
 - [ ] More documentation for custom model integration.
 - [ ] Community compatibility reports.
