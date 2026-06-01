@@ -41,6 +41,62 @@ def _default_return_dict_from_config(config: Any) -> bool:
     return bool(getattr(config, "use_return_dict"))
 
 
+def _is_expected_ignored_vision_key(key: str) -> bool:
+    return key.startswith("text_model.") or key in {
+        "logit_scale",
+        "text_projection.weight",
+        "visual_projection.weight",
+    }
+
+
+def _format_key_examples(keys: list[str], *, limit: int = 6) -> list[str]:
+    examples = keys[:limit]
+    lines = [f"  - {key}" for key in examples]
+    remaining = len(keys) - len(examples)
+    if remaining > 0:
+        lines.append(f"  - ... and {remaining} more")
+    return lines
+
+
+def _format_component_load_report(
+    component_name: str,
+    model_name_or_path: str,
+    loading_info: dict[str, Any] | None,
+) -> str | None:
+    if not loading_info:
+        return None
+
+    missing_keys = list(loading_info.get("missing_keys", []) or [])
+    unexpected_keys = list(loading_info.get("unexpected_keys", []) or [])
+    mismatched_keys = list(loading_info.get("mismatched_keys", []) or [])
+    error_msgs = list(loading_info.get("error_msgs", []) or [])
+    if not (missing_keys or unexpected_keys or mismatched_keys or error_msgs):
+        return None
+
+    lines = [f"[llava-anything] {component_name} load summary from: {model_name_or_path}"]
+    if unexpected_keys:
+        expected_vision_only = all(_is_expected_ignored_vision_key(str(key)) for key in unexpected_keys)
+        lines.append(f"ignored checkpoint weights: {len(unexpected_keys)}")
+        if expected_vision_only:
+            lines.append(
+                "  These are expected when loading only the vision encoder from a CLIP-style checkpoint; "
+                "the CLIP text tower and contrastive heads are not used."
+            )
+        else:
+            lines.append("  These weights exist in the checkpoint but are not used by this component.")
+        lines.extend(_format_key_examples([str(key) for key in unexpected_keys]))
+    if missing_keys:
+        lines.append(f"Missing model weights initialized by this run: {len(missing_keys)}")
+        lines.extend(_format_key_examples([str(key) for key in missing_keys]))
+    if mismatched_keys:
+        lines.append(f"Shape-mismatched weights skipped: {len(mismatched_keys)}")
+        lines.extend(_format_key_examples([str(key) for key in mismatched_keys]))
+    if error_msgs:
+        lines.append("Loader messages:")
+        lines.extend(_format_key_examples([str(message) for message in error_msgs]))
+    return "\n".join(lines)
+
+
 def _as_image_size(image_size: Any) -> list[int]:
     if isinstance(image_size, (list, tuple)):
         return [int(image_size[0]), int(image_size[1])]
@@ -209,12 +265,24 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
             resized_vocab_size = language_model.get_input_embeddings().num_embeddings
             config.text_config.vocab_size = resized_vocab_size
             config.vocab_size = resized_vocab_size
-        vision_tower = AutoModel.from_pretrained(
+        vision_model_kwargs.setdefault("output_loading_info", True)
+        loaded_vision_tower = AutoModel.from_pretrained(
             vision_model_name_or_path,
             config=config.vision_config,
             trust_remote_code=config.vision_trust_remote_code,
             **vision_model_kwargs,
         )
+        if isinstance(loaded_vision_tower, tuple):
+            vision_tower, vision_loading_info = loaded_vision_tower
+            load_report = _format_component_load_report(
+                "vision tower",
+                vision_model_name_or_path,
+                vision_loading_info,
+            )
+            if load_report is not None:
+                print(load_report)
+        else:
+            vision_tower = loaded_vision_tower
         return cls(config, language_model=language_model, vision_tower=vision_tower, init_weights=False)
 
     def get_input_embeddings(self) -> nn.Module:
