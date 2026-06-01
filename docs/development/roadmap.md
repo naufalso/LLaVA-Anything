@@ -11,8 +11,9 @@ image-text inference patterns.
 
 The current implementation is an MVP HF-native package that has passed local
 unit tests plus NVIDIA GPU runtime smokes for Apertus/SigLIP and a lower-memory
-Qwen3/CLIP-base combination. The projector is still randomly initialized, so
-image-text generation is a runtime/API check rather than a quality signal.
+Qwen3/CLIP-base combination. Stage-1 projector pretraining and Stage-2 full
+model finetuning are implemented, with full Stage-2 finetuning completed and
+tested on `qwen3-1.7b-clip-base`.
 
 ## Product Goals
 
@@ -51,6 +52,8 @@ Implemented:
   - `examples/qwen3_clip.yaml`
   - `examples/apertus_siglip.yaml`
   - `examples/qwen3_1_7b_clip_base.yaml` for lower-memory GPU smoke tests
+  - `examples/qwen3_1_7b_clip_base_stage2_smoke.yaml` for partial-data Stage-2 smoke tests
+  - `examples/qwen3_1_7b_clip_base_stage2_full.yaml` for full Stage-2 finetuning
 - Tokenizer YAML options including `padding_side` and `model_max_length`.
 - Unit and smoke regression tests for:
   - config serialization
@@ -60,6 +63,16 @@ Implemented:
   - tokenizer vocab handling for pretrained checkpoints with reserved vocab rows
   - wrapper device/dtype behavior under dispatched pretrained components
   - runtime metadata dependencies needed for GPU validation
+  - saved processor reload through `AutoProcessor`
+  - saved full tiny composed model reload through `AutoModelForImageTextToText`
+  - `pipeline("image-text-to-text")` dict and chat inputs with a tiny local model and processor
+- Committed validation scripts:
+  - `scripts/validate_gpu_components.py`
+  - `scripts/smoke_image_text_generation.py`
+- Committed data preparation scripts:
+  - `scripts/download_llava_pretrain.sh`
+- Stage-2 full model finetuning completed and tested with
+  `examples/qwen3_1_7b_clip_base_stage2_full.yaml` on `qwen3-1.7b-clip-base`.
 - Architecture decision record:
   - `docs/architecture/adr-001-hf-native-composition.md`
 
@@ -115,16 +128,16 @@ Known validation notes:
   downloads.
 - Apertus emits an optional xIELU warning when the custom CUDA kernel is not
   installed; it falls back successfully.
-- Projector weights are still randomly initialized, so generated text is only an
-  API/runtime smoke and not a quality signal.
+- The May 19 GPU runtime smokes used randomly initialized projector weights, so
+  those generated texts were API/runtime checks rather than quality signals.
 
 Still not verified:
 
-- `pipeline("image-text-to-text")` compatibility.
-- Full composed model save/load with actual component weights.
-- `AutoModelForImageTextToText.from_pretrained(...)` from saved full weights.
+- `pipeline("image-text-to-text")` compatibility for full 8B target checkpoints on GPU.
+- Full composed model save/load with actual 8B target component weights.
 - Full Qwen3-8B + CLIP-large load/generate after model shards are locally cached.
-- Training or fine-tuning.
+- Broader training and fine-tuning validation across additional model and vision
+  tower combinations.
 
 ## Architecture Direction
 
@@ -264,13 +277,13 @@ Tasks:
 
 - Validate `AutoProcessor.from_pretrained(...)`.
 - Validate `AutoModelForImageTextToText.from_pretrained(...)`.
-- Validate `pipeline("image-text-to-text", model=..., processor=...)`.
+- Validate `pipeline("image-text-to-text", model=..., processor=...)`. Done for tiny local dict and chat-style inputs.
 - Confirm `apply_chat_template` works for:
   - Qwen3 chat template
   - Apertus chat template
   - no chat template fallback
 - Confirm image-token expansion counts match the model feature count.
-- Add tests for saved processor reload from temporary directories.
+- Add tests for saved processor reload from temporary directories. Done.
 - Document the expected prompt format.
 
 Validation examples:
@@ -290,7 +303,7 @@ model = AutoModelForImageTextToText.from_pretrained(
 Exit criteria:
 
 - Auto APIs work after saving config, processor, and model weights.
-- Pipeline either works or has a documented blocker with an issue/task.
+- Pipeline either works or has a documented blocker with an issue/task. Done for tiny local dict and chat-style coverage; full target GPU smokes remain.
 
 ## Milestone 3 - Full Save/Load Workflow
 
@@ -299,7 +312,7 @@ without custom build code.
 
 Tasks:
 
-- Extend builder with a documented command for full composition:
+- Extend builder with a documented command for full composition. Done:
 
 ```bash
 uv run llava-anything-build examples/qwen3_clip.yaml \
@@ -307,23 +320,23 @@ uv run llava-anything-build examples/qwen3_clip.yaml \
   --load-pretrained-components
 ```
 
-- Verify saved files include:
+- Verify saved files include. Done for tiny local full artifacts:
   - config
   - tokenizer
-  - image processor
+  - image processor payload in `processor_config.json`
   - processor config
   - model weights
-- Confirm `AutoModelForImageTextToText.from_pretrained` reloads the full model.
+- Confirm `AutoModelForImageTextToText.from_pretrained` reloads the full model. Done for tiny local full artifacts.
 - Confirm additional image token additions resize language embeddings before
-  saving.
-- Add tests using tiny local models to avoid 8B dependencies.
+  saving. Done for tiny local full artifacts.
+- Add tests using tiny local models to avoid 8B dependencies. Done.
 
 Exit criteria:
 
 - A composed model can be loaded with only `AutoProcessor` and
-  `AutoModelForImageTextToText`.
+  `AutoModelForImageTextToText`. Done for tiny local components; full target GPU validation remains.
 - No direct call to `model_from_yaml_dict` is required for inference after
-  saving.
+  saving. Done for tiny local full artifacts.
 
 ## Milestone 4 - Tiny Integration Models
 
@@ -342,16 +355,16 @@ Candidate vision models:
 
 Tasks:
 
-- Add fixture that creates and saves a tiny text model.
-- Add fixture that creates and saves a tiny vision model.
-- Add fixture that creates tokenizer/image processor artifacts.
-- Run builder against local file paths.
-- Test full save/load/generate.
+- Add fixture that creates and saves a tiny text model. Done.
+- Add fixture that creates and saves a tiny vision model. Done.
+- Add fixture that creates tokenizer/image processor artifacts. Done.
+- Run builder against local file paths. Done.
+- Test full save/load/generate. Done.
 
 Exit criteria:
 
 - CI can verify the core composition flow without GPU and without downloading
-  giant models.
+  giant models. Done with local tiny generated components.
 
 ## Milestone 5 - Training Data Path
 
@@ -360,26 +373,158 @@ data.
 
 Tasks:
 
-- Define training YAML schema separately from model YAML.
-- Add dataset reader for LLaVA conversation JSON.
-- Add image loading and preprocessing path.
-- Add label masking for user tokens and image tokens.
-- Add collator for variable-length image-expanded prompts.
-- Add minimal `Trainer`/`SFTTrainer` entry point.
+- Define training YAML schema separately from model YAML. Done for stage-1 projector pretraining.
+- Add dataset reader for LLaVA conversation JSON. Done for JSON/JSONL LLaVA-style records.
+- Add image loading and preprocessing path. Done for single-image records.
+- Add label masking for user tokens and image tokens. Done for assistant-only loss.
+- Add collator for variable-length image-expanded prompts. Done.
+- Add minimal `Trainer`/`SFTTrainer` entry point. Done with `Trainer` via `llava-anything-train` (`llava-anything-pretrain` remains as a compatibility alias).
+- Add checkpoint-based training resume for Stage-2. Done with `model_checkpoint` training YAML.
+- Add available-image filtering for partial LLaVA-Instruct downloads. Done with `data.available_images_only`.
+- Add LLaVA-Pretrain download/extract helper. Done with `scripts/download_llava_pretrain.sh`.
 - Support trainable module selection:
-  - projector only
-  - projector + vision tower
-  - projector + LoRA on language model
-  - full fine-tune
-- Add PEFT dependency only as optional extra if used.
+  - projector only. Done.
+  - projector + vision tower. Basic selection supported; full validation pending.
+  - projector + LoRA on language model. Pending optional PEFT work.
+  - full fine-tune. Done and tested on `qwen3-1.7b-clip-base`.
+- Add PEFT dependency only as optional extra if used. Pending.
 
 Exit criteria:
 
-- A tiny synthetic image-text dataset can overfit on a tiny model.
-- Projector-only training runs end to end.
-- Loss decreases on the synthetic task.
+- A tiny synthetic image-text dataset can overfit on a tiny model. Initial decreasing-loss smoke done.
+- Projector-only training runs end to end. Done on tiny generated components.
+- Loss decreases on the synthetic task. Done.
+- LLaVA-Pretrain data can be prepared with one script, producing
+  `data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json` and extracted image
+  shard directories such as `data/LLaVA-Pretrain/00000/`.
+- Stage-2 can start from a Stage-1 composed checkpoint and use the
+  LLaVA-Instruct mix JSON with either available-image filtering for smoke runs
+  or the full downloaded image set for full finetuning. Done and tested on
+  `qwen3-1.7b-clip-base`.
 
-## Milestone 6 - Projector And Adapter Improvements
+## Milestone 6 - LLaVA-NeXT Any-Resolution Support
+
+Goal: replace fixed image-token counts with LLaVA-NeXT-style image packing when
+enabled, then re-run Stage-1 and Stage-2 training before scaling out.
+
+Rationale:
+
+- Correct image-token accounting is a model/data contract, not just an
+  optimization.
+- Distributed training should scale a validated image packing path rather than
+  the current fixed-token placeholder behavior.
+- Fixed-token mode should remain available for simpler CLIP/SigLIP experiments
+  and regression tests.
+
+Tasks:
+
+- Implement image grid pinpoints in config.
+- Compute per-image feature counts from original image sizes.
+- Preserve base image features plus unpadded high-resolution features.
+- Add newline feature insertion.
+- Update processor expansion to match variable image sizes.
+- Keep fixed-token mode available through an explicit image mode setting.
+- Add tests for:
+  - square image
+  - wide image
+  - tall image
+  - multiple image sizes in a batch
+- Re-run single-process Stage-1 projector pretraining after any-resolution
+  support lands.
+- Re-run single-process Stage-2 finetuning from the Stage-1 checkpoint before
+  moving back to distributed scaling.
+
+Exit criteria:
+
+- Processor image-token expansion and model image-feature packing agree for all
+  supported image sizes.
+- Any-resolution mode works with CLIP and SigLIP.
+- Fixed-token mode still passes existing tests and smoke runs.
+- Stage-1 and Stage-2 training can be retried successfully on the corrected
+  image packing path before multi-GPU work starts.
+
+## Milestone 7 - Multi-GPU And Multi-Node Training
+
+Goal: make distributed training a first-class, documented, and tested path for
+Stage-1 projector pretraining and Stage-2 full finetuning after image packing
+has been validated in single-process retraining.
+
+Target launch modes:
+
+- Single-process CPU/GPU smoke for local development.
+- Single-node multi-GPU DDP through `torchrun` and/or `accelerate launch`.
+- Multi-node DDP through `torchrun` with explicit rank, world size, rendezvous,
+  and master address settings.
+- Optional FSDP or DeepSpeed config pass-through through standard
+  `TrainingArguments` fields when large-model finetuning requires sharding.
+
+Tasks:
+
+- Confirm all training YAML fields intended for distributed runs pass cleanly
+  through to `transformers.TrainingArguments`.
+- Add rank-aware final checkpoint saving so only the world process zero writes
+  the final model and processor after `trainer.train()`.
+- Add distributed-safe logging behavior for preview samples, trainable parameter
+  summaries, and final CLI output.
+- Document launch commands for:
+  - single-node multi-GPU Stage-1 projector pretraining
+  - single-node multi-GPU Stage-2 full finetuning
+  - multi-node Stage-1 and Stage-2 runs
+  - optional `accelerate config` / `accelerate launch` usage
+- Add example distributed training YAML snippets for DDP, FSDP, and/or DeepSpeed
+  without making those options required for normal single-GPU runs.
+- Add tiny-model distributed smoke tests that can run with two local processes
+  and synthetic image-text data.
+- Add a GPU validation script for multi-GPU launch checks on real components
+  when at least two CUDA devices are available.
+- Add a multi-node validation checklist covering environment variables, shared
+  storage assumptions, dataset availability, rendezvous settings, checkpoint
+  output ownership, and failure recovery.
+- Document guidance against using `device_map="auto"` for DDP/FSDP training
+  unless the launch strategy explicitly supports it.
+
+Validation:
+
+```bash
+uv run pytest -q
+torchrun --standalone --nproc_per_node=2 \
+  -m llava_anything.training examples/tiny_distributed_smoke.yaml
+```
+
+Example single-node launch:
+
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  -m llava_anything.training examples/qwen3_1_7b_clip_base_pretrain.yaml
+```
+
+Example multi-node launch:
+
+```bash
+torchrun \
+  --nnodes=2 \
+  --node_rank=${NODE_RANK} \
+  --nproc_per_node=4 \
+  --master_addr=${MASTER_ADDR} \
+  --master_port=${MASTER_PORT} \
+  -m llava_anything.training examples/qwen3_1_7b_clip_base_stage2_full.yaml
+```
+
+Exit criteria:
+
+- Stage-1 projector pretraining runs successfully on at least two GPUs on one
+  node with no duplicate final checkpoint writes.
+- Stage-2 full finetuning starts from a Stage-1 checkpoint and runs successfully
+  on at least two GPUs on one node.
+- Tiny two-process distributed training is covered by an automated smoke test or
+  a committed validation script with clear skip behavior when distributed
+  resources are unavailable.
+- Multi-node training has a documented, manually validated launch recipe and
+  checklist.
+- README training docs clearly state what is supported, what has been tested,
+  and which launchers/configs are recommended.
+
+## Milestone 8 - Projector And Adapter Improvements
 
 Goal: make the multimodal adapter configurable enough for real experiments.
 
@@ -410,32 +555,7 @@ Exit criteria:
 - Projector configs are documented and validated.
 - Pretrained projector weights can be loaded independently from the LLM.
 
-## Milestone 7 - LLaVA-NeXT Any-Resolution Support
-
-Goal: replace fixed image-token counts with LLaVA-NeXT-style image packing when
-enabled.
-
-Tasks:
-
-- Implement image grid pinpoints in config.
-- Compute per-image feature counts from original image sizes.
-- Preserve base image features plus unpadded high-resolution features.
-- Add newline feature insertion.
-- Update processor expansion to match variable image sizes.
-- Add tests for:
-  - square image
-  - wide image
-  - tall image
-  - multiple image sizes in a batch
-- Keep fixed-token mode available for simpler CLIP/SigLIP experiments.
-
-Exit criteria:
-
-- Processor image-token expansion and model image-feature packing agree for all
-  supported image sizes.
-- Any-resolution mode works with CLIP and SigLIP.
-
-## Milestone 8 - Trust Remote Code Policy
+## Milestone 9 - Trust Remote Code Policy
 
 Goal: safely support models requiring custom Transformers code.
 
@@ -452,7 +572,7 @@ Exit criteria:
 - Remote-code support is deliberate, documented, and tested on at least one real
   model or clearly marked experimental.
 
-## Milestone 9 - Inference UX
+## Milestone 10 - Inference UX
 
 Goal: make common inference flows easy and documented.
 
@@ -473,7 +593,7 @@ Exit criteria:
 
 - A new user can run a documented inference smoke test without reading source.
 
-## Milestone 10 - Evaluation And Quality Checks
+## Milestone 11 - Evaluation And Quality Checks
 
 Goal: establish lightweight correctness checks before adding heavy benchmarks.
 
@@ -494,7 +614,7 @@ Exit criteria:
 
 - Most integration failures can be diagnosed from one command output.
 
-## Milestone 11 - Packaging And Release
+## Milestone 12 - Packaging And Release
 
 Goal: make the project usable as a standalone GitHub package.
 
@@ -627,6 +747,14 @@ Required docs before broader sharing:
 - Adapter/projector guide.
 - Troubleshooting guide.
 
+Low-priority future data work:
+
+- Consider re-hosting the scattered Stage-1 and Stage-2 training assets as a
+  unified Hugging Face dataset mirror so users can prepare data without manual
+  multi-source downloads and archive extraction. This should wait until the
+  current training path is stable and dataset licensing/redistribution details
+  are reviewed.
+
 Troubleshooting should include:
 
 - image token count mismatch
@@ -697,9 +825,7 @@ uv run llava-anything-build examples/apertus_siglip.yaml --output-dir checkpoint
 uv run llava-anything-build examples/qwen3_1_7b_clip_base.yaml --output-dir checkpoints/qwen3-1.7b-clip-base-config
 
 Recommended next work:
-1. Validate `pipeline("image-text-to-text")` compatibility.
-2. Implement and test full composed model save/load with actual component weights.
-3. Add committed GPU validation and inference smoke scripts instead of relying on
-   one-off `/tmp` scripts.
-4. Rerun Qwen3-8B/CLIP-large once weights are available locally.
+1. Run `pipeline("image-text-to-text")` and saved-model smokes against the full GPU target artifacts.
+2. Rerun Qwen3-8B/CLIP-large once weights are available locally.
+3. Broaden Stage-2 training validation beyond `qwen3-1.7b-clip-base`.
 ```

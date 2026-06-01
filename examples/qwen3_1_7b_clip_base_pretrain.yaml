@@ -1,0 +1,30 @@
+model_yaml: examples/qwen3_1_7b_clip_base.yaml
+load_pretrained_components: true
+model_kwargs:
+  torch_dtype: bfloat16
+
+data:
+  data_path: data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json
+  image_folder: data/LLaVA-Pretrain
+
+logging:
+  preview_samples: 2
+
+training:
+  output_dir: checkpoints/qwen3-1.7b-clip-base-pretrain-projector
+  trainable_modules: projector
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 16
+  num_train_epochs: 1
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  bf16: true
+  logging_steps: 10
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 2
+  remove_unused_columns: false
+  dataloader_num_workers: 4
+  report_to: ["wandb"]

@@ -7,3 +7,6 @@ dist/
 build/
 *.egg-info/
 LLaVA-NeXT/
+data/
+wandb/
+checkpoints/
