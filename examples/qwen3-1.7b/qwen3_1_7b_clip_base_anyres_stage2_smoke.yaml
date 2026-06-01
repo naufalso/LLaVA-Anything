@@ -1,0 +1,29 @@
+model_checkpoint: checkpoints/qwen3-1.7b-clip-base-anyres-pretrain-projector
+model_kwargs:
+  torch_dtype: bfloat16
+
+data:
+  data_path: data/LLaVA-Instruct-150K/llava_v1_5_mix665k.json
+  image_folder: data/LLaVA-Instruct-150K
+  available_images_only: true
+  max_samples: 32
+
+logging:
+  preview_samples: 2
+
+training:
+  output_dir: checkpoints/qwen3-1.7b-clip-base-anyres-stage2-smoke
+  trainable_modules: full
+  max_steps: 5
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  bf16: true
+  logging_steps: 1
+  save_strategy: "no"
+  remove_unused_columns: false
+  dataloader_num_workers: 2
+  report_to: []

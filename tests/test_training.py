@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from PIL import Image
 from transformers import AutoProcessor
 
 from llava_anything.builder import save_from_yaml
@@ -85,6 +86,80 @@ def test_pretrain_collator_pads_text_and_stacks_images(
     assert batch["attention_mask"].shape == batch["input_ids"].shape
     assert batch["labels"].shape == batch["input_ids"].shape
     assert batch["pixel_values"].shape == (2, 3, 8, 8)
+
+
+
+def test_pretrain_dataset_collates_anyres_images_with_image_sizes(
+    tmp_path: Path,
+    tiny_text_component_dir: Path,
+    tiny_vision_component_dir: Path,
+) -> None:
+    model_yaml = tmp_path / "anyres-model.yaml"
+    model_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "image_token": "<image>",
+                    "image_token_index": 63,
+                    "projector_type": "linear",
+                    "vision_feature_layer": -1,
+                    "vision_feature_select_strategy": "default",
+                },
+                "image": {
+                    "mode": "anyres",
+                    "anyres": {"enabled": True, "grid_pinpoints": [[8, 8], [8, 16]]},
+                },
+                "text_model": {"name_or_path": str(tiny_text_component_dir), "tokenizer": {}},
+                "vision_model": {"name_or_path": str(tiny_vision_component_dir), "image_processor": {"patch_size": 4}},
+            }
+        )
+    )
+    model_dir = tmp_path / "anyres-model"
+    save_from_yaml(model_yaml, model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(model_dir)
+    square_path = tmp_path / "square.jpg"
+    wide_path = tmp_path / "wide.jpg"
+
+    Image.new("RGB", (8, 8)).save(square_path)
+    Image.new("RGB", (16, 8)).save(wide_path)
+    data_path = tmp_path / "anyres.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "square",
+                    "image": square_path.name,
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "hello"},
+                    ],
+                },
+                {
+                    "id": "wide",
+                    "image": wide_path.name,
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "hello"},
+                    ],
+                },
+            ]
+        )
+    )
+    dataset = LlavaPretrainDataset(data_path=data_path, image_folder=tmp_path, processor=processor)
+    collator = LlavaPretrainDataCollator(processor.tokenizer)
+
+    square = dataset[0]
+    wide = dataset[1]
+    batch = collator([square, wide])
+
+    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    assert square["image_sizes"].tolist() == [8, 8]
+    assert wide["image_sizes"].tolist() == [8, 16]
+    assert square["pixel_values"].shape == (2, 3, 8, 8)
+    assert wide["pixel_values"].shape == (3, 3, 8, 8)
+    assert batch["pixel_values"].shape == (2, 3, 3, 8, 8)
+    assert batch["image_sizes"].tolist() == [[8, 8], [8, 16]]
+    assert (batch["input_ids"] == image_token_id).sum(dim=1).tolist() == [10, 14]
 
 
 def test_pretrain_dataset_can_filter_records_to_available_images(

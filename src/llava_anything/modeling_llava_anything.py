@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from transformers import AutoModel, AutoModelForCausalLM, PreTrainedModel
 from transformers.activations import ACT2FN
+from transformers.image_processing_utils import select_best_resolution
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import ModelOutput
 
@@ -38,6 +39,48 @@ def _default_return_dict_from_config(config: Any) -> bool:
     if return_dict is not missing:
         return bool(return_dict)
     return bool(getattr(config, "use_return_dict"))
+
+
+def _as_image_size(image_size: Any) -> list[int]:
+    if isinstance(image_size, (list, tuple)):
+        return [int(image_size[0]), int(image_size[1])]
+    if isinstance(image_size, torch.Tensor):
+        return [int(value) for value in image_size.detach().cpu().tolist()]
+    if hasattr(image_size, "tolist"):
+        return [int(value) for value in image_size.tolist()]
+    raise TypeError(f"Unsupported image_size type: {type(image_size)!r}")
+
+
+def get_anyres_image_grid_shape(image_size: Any, grid_pinpoints: list[list[int]], patch_size: int) -> tuple[int, int]:
+    if not isinstance(grid_pinpoints, list):
+        raise TypeError("grid_pinpoints should be a list of [height, width] pairs.")
+    best_height, best_width = select_best_resolution(_as_image_size(image_size), grid_pinpoints)
+    return best_height // patch_size, best_width // patch_size
+
+
+def image_size_to_num_patches(image_size: Any, grid_pinpoints: list[list[int]], patch_size: int) -> int:
+    if not isinstance(grid_pinpoints, list):
+        raise TypeError("grid_pinpoints should be a list of [height, width] pairs.")
+    best_height, best_width = select_best_resolution(_as_image_size(image_size), grid_pinpoints)
+    return ((best_height + patch_size - 1) // patch_size) * ((best_width + patch_size - 1) // patch_size) + 1
+
+
+def unpad_image(tensor: torch.Tensor, original_size: Any) -> torch.Tensor:
+    original_height, original_width = _as_image_size(original_size)
+    current_height, current_width = tensor.shape[1:]
+
+    original_aspect_ratio = original_width / original_height
+    current_aspect_ratio = current_width / current_height
+    if original_aspect_ratio > current_aspect_ratio:
+        scale_factor = current_width / original_width
+        new_height = int(round(original_height * scale_factor, 7))
+        padding = (current_height - new_height) // 2
+        return tensor[:, padding : current_height - padding, :]
+
+    scale_factor = current_height / original_height
+    new_width = int(round(original_width * scale_factor, 7))
+    padding = (current_width - new_width) // 2
+    return tensor[:, :, padding : current_width - padding]
 
 
 class IdentityProjector(nn.Module):
@@ -217,19 +260,7 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
             )
         return selected
 
-    def get_image_features(
-        self,
-        pixel_values: torch.FloatTensor,
-        image_sizes: torch.LongTensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        del image_sizes
-        if pixel_values.dim() == 5:
-            batch_size, num_images, channels, height, width = pixel_values.shape
-            pixel_values = pixel_values.reshape(batch_size * num_images, channels, height, width)
-        elif pixel_values.dim() != 4:
-            raise ValueError(f"pixel_values must be 4D or 5D, got shape {tuple(pixel_values.shape)}")
-
+    def _project_vision_outputs(self, pixel_values: torch.FloatTensor, **kwargs: Any) -> torch.Tensor:
         vision_parameter = next(self.vision_tower.parameters())
         vision_outputs = self.vision_tower(
             pixel_values.to(device=vision_parameter.device, dtype=vision_parameter.dtype),
@@ -243,7 +274,115 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
             projector_parameter.device != selected.device or projector_parameter.dtype != selected.dtype
         ):
             self.multi_modal_projector.to(device=selected.device, dtype=selected.dtype)
-        image_features = self.multi_modal_projector(selected)
+        return self.multi_modal_projector(selected)
+
+    def pack_image_features(
+        self,
+        image_features: tuple[torch.Tensor, ...],
+        image_sizes: torch.LongTensor,
+    ) -> torch.Tensor:
+        if self.config.image_grid_pinpoints is None:
+            raise ValueError("image_grid_pinpoints is required when image_mode='anyres'.")
+
+        new_image_features = []
+        image_size = int(self.config.vision_config.image_size)
+        patch_size = int(self.config.vision_config.patch_size)
+        patch_grid_height = patch_grid_width = image_size // patch_size
+
+        for image_idx, image_feature in enumerate(image_features):
+            if image_feature.shape[0] > 1:
+                base_image_feature = image_feature[0]
+                highres_feature = image_feature[1:]
+                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+                    image_sizes[image_idx],
+                    self.config.image_grid_pinpoints,
+                    image_size,
+                )
+                expected_patch_tokens = patch_grid_height * patch_grid_width
+                if highres_feature.shape[1] != expected_patch_tokens:
+                    raise ValueError(
+                        "Image feature shape does not match the any-resolution grid. "
+                        f"features={tuple(highres_feature.shape)}, expected_patch_tokens={expected_patch_tokens}."
+                    )
+                highres_feature = highres_feature.view(
+                    num_patch_height,
+                    num_patch_width,
+                    patch_grid_height,
+                    patch_grid_width,
+                    -1,
+                )
+                highres_feature = highres_feature.permute(4, 0, 2, 1, 3).contiguous()
+                highres_feature = highres_feature.flatten(1, 2).flatten(2, 3)
+                highres_feature = unpad_image(highres_feature, image_sizes[image_idx])
+                highres_feature = torch.cat(
+                    (
+                        highres_feature,
+                        self.image_newline[:, None, None]
+                        .expand(*highres_feature.shape[:-1], 1)
+                        .to(highres_feature.device, highres_feature.dtype),
+                    ),
+                    dim=-1,
+                )
+                highres_feature = highres_feature.flatten(1, 2).transpose(0, 1)
+                image_feature = torch.cat((base_image_feature, highres_feature), dim=0)
+            else:
+                image_feature = image_feature[0]
+                image_feature = torch.cat((image_feature, self.image_newline[None].to(image_feature)), dim=0)
+            new_image_features.append(image_feature)
+
+        return torch.cat(new_image_features, dim=0).to(device=self.device, dtype=self.dtype)
+
+    def _get_anyres_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_sizes: torch.LongTensor | None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if image_sizes is None:
+            raise ValueError("image_sizes is required when image_mode='anyres'.")
+        if self.config.image_grid_pinpoints is None:
+            raise ValueError("image_grid_pinpoints is required when image_mode='anyres'.")
+
+        image_size = int(self.config.vision_config.image_size)
+        image_num_patches = [
+            image_size_to_num_patches(
+                image_size=image_size_value,
+                grid_pinpoints=self.config.image_grid_pinpoints,
+                patch_size=image_size,
+            )
+            for image_size_value in image_sizes
+        ]
+        if pixel_values.dim() == 5:
+            pixel_values = torch.cat(
+                [
+                    image_pixel_values[:num_patches]
+                    for image_pixel_values, num_patches in zip(pixel_values, image_num_patches)
+                ],
+                dim=0,
+            )
+        elif pixel_values.dim() != 4:
+            raise ValueError(f"pixel_values must be 4D or 5D, got shape {tuple(pixel_values.shape)}")
+
+        projected = self._project_vision_outputs(pixel_values, **kwargs)
+        image_features = torch.split(projected, image_num_patches, dim=0)
+        return self.pack_image_features(image_features, image_sizes)
+
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_sizes: torch.LongTensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if getattr(self.config, "image_mode", "fixed") == "anyres":
+            return self._get_anyres_image_features(pixel_values, image_sizes, **kwargs)
+
+        if pixel_values.dim() == 5:
+            batch_size, num_images, channels, height, width = pixel_values.shape
+            pixel_values = pixel_values.reshape(batch_size * num_images, channels, height, width)
+        elif pixel_values.dim() != 4:
+            raise ValueError(f"pixel_values must be 4D or 5D, got shape {tuple(pixel_values.shape)}")
+
+        image_features = self._project_vision_outputs(pixel_values, **kwargs)
         return image_features.to(device=self.device, dtype=self.dtype)
 
     def _merge_input_ids_with_image_features(

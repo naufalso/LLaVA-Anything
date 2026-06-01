@@ -163,20 +163,30 @@ class LlavaPretrainDataset(Dataset):
         eos = self.processor.tokenizer.eos_token or ""
         full_text = f"{prefix}{assistant_text}{eos}"
 
-        input_ids = _tokenize_text(self.processor, full_text)
-        prefix_ids = _tokenize_text(self.processor, prefix)
+        image = self._load_image(record)
+        if getattr(self.processor, "image_mode", "fixed") == "anyres":
+            full_inputs = self.processor(images=image, text=full_text, return_tensors="pt", add_special_tokens=False)
+            prefix_inputs = self.processor(images=image, text=prefix, return_tensors="pt", add_special_tokens=False)
+            input_ids = full_inputs["input_ids"][0]
+            prefix_ids = prefix_inputs["input_ids"][0]
+            image_inputs = full_inputs
+        else:
+            input_ids = _tokenize_text(self.processor, full_text)
+            prefix_ids = _tokenize_text(self.processor, prefix)
+            image_inputs = self.processor(images=image, return_tensors="pt")
+
         labels = input_ids.clone()
         labels[: prefix_ids.shape[0]] = IGNORE_INDEX
         labels[input_ids == self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)] = IGNORE_INDEX
 
-        image = self._load_image(record)
-        image_inputs = self.processor(images=image, return_tensors="pt")
-
-        return {
+        sample = {
             "input_ids": input_ids,
             "labels": labels,
             "pixel_values": image_inputs["pixel_values"][0],
         }
+        if "image_sizes" in image_inputs:
+            sample["image_sizes"] = image_inputs["image_sizes"][0]
+        return sample
 
 
 @dataclass
@@ -198,14 +208,32 @@ class LlavaPretrainDataCollator:
         input_ids = self._pad_sequence([instance["input_ids"] for instance in instances], pad_token_id)
         labels = self._pad_sequence([instance["labels"] for instance in instances], IGNORE_INDEX)
         attention_mask = input_ids.ne(pad_token_id)
-        pixel_values = torch.stack([instance["pixel_values"] for instance in instances])
+        pixel_value_tensors = [instance["pixel_values"] for instance in instances]
+        if pixel_value_tensors[0].dim() == 4:
+            max_patches = max(tensor.shape[0] for tensor in pixel_value_tensors)
+            padded_pixel_values = []
+            for tensor in pixel_value_tensors:
+                if tensor.shape[0] < max_patches:
+                    padding = torch.zeros(
+                        (max_patches - tensor.shape[0], *tensor.shape[1:]),
+                        dtype=tensor.dtype,
+                        device=tensor.device,
+                    )
+                    tensor = torch.cat([tensor, padding], dim=0)
+                padded_pixel_values.append(tensor)
+            pixel_values = torch.stack(padded_pixel_values)
+        else:
+            pixel_values = torch.stack(pixel_value_tensors)
 
-        return {
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "pixel_values": pixel_values,
         }
+        if "image_sizes" in instances[0]:
+            batch["image_sizes"] = torch.stack([instance["image_sizes"] for instance in instances])
+        return batch
 
 
 def apply_trainable_modules(model: LlavaAnythingForConditionalGeneration, trainable_modules: str = "projector") -> list[str]:

@@ -42,6 +42,8 @@ def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
     text_section = _section(data, "text_model")
     vision_section = _section(data, "vision_model")
     processor_section = _section(vision_section, "image_processor")
+    image_section = _section(data, "image")
+    anyres_section = _section(image_section, "anyres")
 
     text_name = text_section.get("name_or_path")
     vision_name = vision_section.get("name_or_path")
@@ -58,6 +60,11 @@ def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
     vision_config = _extract_vision_config(
         AutoConfig.from_pretrained(vision_name, trust_remote_code=vision_trust_remote_code)
     )
+
+    image_mode = image_section.get("mode", model_section.get("image_mode", "fixed"))
+    if anyres_section.get("enabled") is True:
+        image_mode = "anyres"
+    image_grid_pinpoints = anyres_section.get("grid_pinpoints", model_section.get("image_grid_pinpoints"))
 
     image_seq_length = model_section.get("image_seq_length")
     if image_seq_length is None:
@@ -79,6 +86,8 @@ def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
         vision_feature_select_strategy=model_section.get("vision_feature_select_strategy", "default"),
         image_seq_length=image_seq_length,
         num_additional_image_tokens=int(processor_section.get("num_additional_image_tokens", 1)),
+        image_mode=image_mode,
+        image_grid_pinpoints=image_grid_pinpoints,
         text_model_name_or_path=text_name,
         vision_model_name_or_path=vision_name,
         trust_remote_code=trust_remote_code,
@@ -137,6 +146,8 @@ def processor_from_yaml_dict(data: dict[str, Any], config: LlavaAnythingConfig) 
         patch_size=image_processor_section.get("patch_size", getattr(config.vision_config, "patch_size", None)),
         vision_feature_select_strategy=config.vision_feature_select_strategy,
         num_additional_image_tokens=config.num_additional_image_tokens,
+        image_mode=getattr(config, "image_mode", "fixed"),
+        image_grid_pinpoints=getattr(config, "image_grid_pinpoints", None),
         chat_template=chat_template,
     )
 

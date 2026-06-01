@@ -143,6 +143,13 @@ Then start projector pretraining:
 uv run llava-anything-train examples/qwen3_1_7b_clip_base_pretrain.yaml
 ```
 
+For LLaVA-NeXT-style any-resolution packing with the same Qwen3 1.7B +
+CLIP ViT-B/32 components, use the anyres config:
+
+```bash
+uv run llava-anything-train examples/qwen3-1.7b/qwen3_1_7b_clip_base_anyres_pretrain.yaml
+```
+
 `llava-anything-pretrain` is still available as a backward-compatible alias for
 older Stage-1 commands.
 
@@ -211,6 +218,17 @@ uv run llava-anything-train examples/qwen3_1_7b_clip_base_stage2_full.yaml
 
 Both configs expect the Stage-1 checkpoint at
 `checkpoints/qwen3-1.7b-clip-base-pretrain-projector`.
+
+For the any-resolution Stage-2 path, first run the anyres Stage-1 command
+above, then use:
+
+```bash
+uv run llava-anything-train examples/qwen3_1_7b_clip_base_anyres_stage2_smoke.yaml
+uv run llava-anything-train examples/qwen3_1_7b_clip_base_anyres_stage2_full.yaml
+```
+
+The anyres Stage-2 configs expect the Stage-1 checkpoint at
+`checkpoints/qwen3-1.7b-clip-base-anyres-pretrain-projector`.
 
 ## Validation Scripts
 

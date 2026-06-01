@@ -1,0 +1,33 @@
+model:
+  model_type: llava_anything
+  image_token: "<image>"
+  vision_feature_layer: -2
+  vision_feature_select_strategy: default
+  projector_type: mlp2x_gelu
+  projector_hidden_act: gelu
+
+image:
+  mode: anyres
+  anyres:
+    enabled: true
+    grid_pinpoints:
+      - [224, 224]
+      - [224, 448]
+      - [448, 224]
+      - [448, 448]
+      - [224, 672]
+      - [672, 224]
+
+text_model:
+  name_or_path: Qwen/Qwen3-1.7B
+  trust_remote_code: false
+  tokenizer:
+    padding_side: left
+    model_max_length: 4096
+
+vision_model:
+  name_or_path: openai/clip-vit-base-patch32
+  trust_remote_code: false
+  image_processor:
+    patch_size: 32
+    num_additional_image_tokens: 1

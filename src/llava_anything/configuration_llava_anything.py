@@ -31,6 +31,8 @@ class LlavaAnythingConfig(PretrainedConfig):
         vision_feature_select_strategy: str = "default",
         image_seq_length: int | None = None,
         num_additional_image_tokens: int = 1,
+        image_mode: str = "fixed",
+        image_grid_pinpoints: list[list[int]] | None = None,
         text_model_name_or_path: str | None = None,
         vision_model_name_or_path: str | None = None,
         trust_remote_code: bool = False,
@@ -49,8 +51,12 @@ class LlavaAnythingConfig(PretrainedConfig):
         self.projector_hidden_act = projector_hidden_act
         self.vision_feature_layer = vision_feature_layer
         self.vision_feature_select_strategy = vision_feature_select_strategy
+        if image_mode not in {"fixed", "anyres"}:
+            raise ValueError(f"image_mode must be 'fixed' or 'anyres', got {image_mode!r}.")
         self.image_seq_length = image_seq_length
         self.num_additional_image_tokens = num_additional_image_tokens
+        self.image_mode = image_mode
+        self.image_grid_pinpoints = image_grid_pinpoints
 
         self.text_model_name_or_path = text_model_name_or_path
         self.vision_model_name_or_path = vision_model_name_or_path
