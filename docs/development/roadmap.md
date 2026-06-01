@@ -402,7 +402,129 @@ Exit criteria:
   or the full downloaded image set for full finetuning. Done and tested on
   `qwen3-1.7b-clip-base`.
 
-## Milestone 6 - Projector And Adapter Improvements
+## Milestone 6 - LLaVA-NeXT Any-Resolution Support
+
+Goal: replace fixed image-token counts with LLaVA-NeXT-style image packing when
+enabled, then re-run Stage-1 and Stage-2 training before scaling out.
+
+Rationale:
+
+- Correct image-token accounting is a model/data contract, not just an
+  optimization.
+- Distributed training should scale a validated image packing path rather than
+  the current fixed-token placeholder behavior.
+- Fixed-token mode should remain available for simpler CLIP/SigLIP experiments
+  and regression tests.
+
+Tasks:
+
+- Implement image grid pinpoints in config.
+- Compute per-image feature counts from original image sizes.
+- Preserve base image features plus unpadded high-resolution features.
+- Add newline feature insertion.
+- Update processor expansion to match variable image sizes.
+- Keep fixed-token mode available through an explicit image mode setting.
+- Add tests for:
+  - square image
+  - wide image
+  - tall image
+  - multiple image sizes in a batch
+- Re-run single-process Stage-1 projector pretraining after any-resolution
+  support lands.
+- Re-run single-process Stage-2 finetuning from the Stage-1 checkpoint before
+  moving back to distributed scaling.
+
+Exit criteria:
+
+- Processor image-token expansion and model image-feature packing agree for all
+  supported image sizes.
+- Any-resolution mode works with CLIP and SigLIP.
+- Fixed-token mode still passes existing tests and smoke runs.
+- Stage-1 and Stage-2 training can be retried successfully on the corrected
+  image packing path before multi-GPU work starts.
+
+## Milestone 7 - Multi-GPU And Multi-Node Training
+
+Goal: make distributed training a first-class, documented, and tested path for
+Stage-1 projector pretraining and Stage-2 full finetuning after image packing
+has been validated in single-process retraining.
+
+Target launch modes:
+
+- Single-process CPU/GPU smoke for local development.
+- Single-node multi-GPU DDP through `torchrun` and/or `accelerate launch`.
+- Multi-node DDP through `torchrun` with explicit rank, world size, rendezvous,
+  and master address settings.
+- Optional FSDP or DeepSpeed config pass-through through standard
+  `TrainingArguments` fields when large-model finetuning requires sharding.
+
+Tasks:
+
+- Confirm all training YAML fields intended for distributed runs pass cleanly
+  through to `transformers.TrainingArguments`.
+- Add rank-aware final checkpoint saving so only the world process zero writes
+  the final model and processor after `trainer.train()`.
+- Add distributed-safe logging behavior for preview samples, trainable parameter
+  summaries, and final CLI output.
+- Document launch commands for:
+  - single-node multi-GPU Stage-1 projector pretraining
+  - single-node multi-GPU Stage-2 full finetuning
+  - multi-node Stage-1 and Stage-2 runs
+  - optional `accelerate config` / `accelerate launch` usage
+- Add example distributed training YAML snippets for DDP, FSDP, and/or DeepSpeed
+  without making those options required for normal single-GPU runs.
+- Add tiny-model distributed smoke tests that can run with two local processes
+  and synthetic image-text data.
+- Add a GPU validation script for multi-GPU launch checks on real components
+  when at least two CUDA devices are available.
+- Add a multi-node validation checklist covering environment variables, shared
+  storage assumptions, dataset availability, rendezvous settings, checkpoint
+  output ownership, and failure recovery.
+- Document guidance against using `device_map="auto"` for DDP/FSDP training
+  unless the launch strategy explicitly supports it.
+
+Validation:
+
+```bash
+uv run pytest -q
+torchrun --standalone --nproc_per_node=2 \
+  -m llava_anything.training examples/tiny_distributed_smoke.yaml
+```
+
+Example single-node launch:
+
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  -m llava_anything.training examples/qwen3_1_7b_clip_base_pretrain.yaml
+```
+
+Example multi-node launch:
+
+```bash
+torchrun \
+  --nnodes=2 \
+  --node_rank=${NODE_RANK} \
+  --nproc_per_node=4 \
+  --master_addr=${MASTER_ADDR} \
+  --master_port=${MASTER_PORT} \
+  -m llava_anything.training examples/qwen3_1_7b_clip_base_stage2_full.yaml
+```
+
+Exit criteria:
+
+- Stage-1 projector pretraining runs successfully on at least two GPUs on one
+  node with no duplicate final checkpoint writes.
+- Stage-2 full finetuning starts from a Stage-1 checkpoint and runs successfully
+  on at least two GPUs on one node.
+- Tiny two-process distributed training is covered by an automated smoke test or
+  a committed validation script with clear skip behavior when distributed
+  resources are unavailable.
+- Multi-node training has a documented, manually validated launch recipe and
+  checklist.
+- README training docs clearly state what is supported, what has been tested,
+  and which launchers/configs are recommended.
+
+## Milestone 8 - Projector And Adapter Improvements
 
 Goal: make the multimodal adapter configurable enough for real experiments.
 
@@ -433,32 +555,7 @@ Exit criteria:
 - Projector configs are documented and validated.
 - Pretrained projector weights can be loaded independently from the LLM.
 
-## Milestone 7 - LLaVA-NeXT Any-Resolution Support
-
-Goal: replace fixed image-token counts with LLaVA-NeXT-style image packing when
-enabled.
-
-Tasks:
-
-- Implement image grid pinpoints in config.
-- Compute per-image feature counts from original image sizes.
-- Preserve base image features plus unpadded high-resolution features.
-- Add newline feature insertion.
-- Update processor expansion to match variable image sizes.
-- Add tests for:
-  - square image
-  - wide image
-  - tall image
-  - multiple image sizes in a batch
-- Keep fixed-token mode available for simpler CLIP/SigLIP experiments.
-
-Exit criteria:
-
-- Processor image-token expansion and model image-feature packing agree for all
-  supported image sizes.
-- Any-resolution mode works with CLIP and SigLIP.
-
-## Milestone 8 - Trust Remote Code Policy
+## Milestone 9 - Trust Remote Code Policy
 
 Goal: safely support models requiring custom Transformers code.
 
@@ -475,7 +572,7 @@ Exit criteria:
 - Remote-code support is deliberate, documented, and tested on at least one real
   model or clearly marked experimental.
 
-## Milestone 9 - Inference UX
+## Milestone 10 - Inference UX
 
 Goal: make common inference flows easy and documented.
 
@@ -496,7 +593,7 @@ Exit criteria:
 
 - A new user can run a documented inference smoke test without reading source.
 
-## Milestone 10 - Evaluation And Quality Checks
+## Milestone 11 - Evaluation And Quality Checks
 
 Goal: establish lightweight correctness checks before adding heavy benchmarks.
 
@@ -517,7 +614,7 @@ Exit criteria:
 
 - Most integration failures can be diagnosed from one command output.
 
-## Milestone 11 - Packaging And Release
+## Milestone 12 - Packaging And Release
 
 Goal: make the project usable as a standalone GitHub package.
 
