@@ -68,14 +68,21 @@ def _conversation_text(record: dict[str, Any]) -> tuple[str, str]:
     return user_text, assistant_text
 
 
-def _render_prefix(processor: LlavaAnythingProcessor, user_text: str) -> str:
-    conversation = [{"role": "user", "content": user_text}]
+def _render_prefix(processor: LlavaAnythingProcessor, user_text: str, system_prompt: str | None = None) -> str:
+    conversation = []
+    if system_prompt:
+        conversation.append({"role": "system", "content": system_prompt})
+    conversation.append({"role": "user", "content": user_text})
     return processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
 
 
-def _preview_record(processor: LlavaAnythingProcessor, record: dict[str, Any]) -> tuple[str, str]:
+def _preview_record(
+    processor: LlavaAnythingProcessor,
+    record: dict[str, Any],
+    system_prompt: str | None = None,
+) -> tuple[str, str]:
     user_text, assistant_text = _conversation_text(record)
-    return _render_prefix(processor, user_text), assistant_text
+    return _render_prefix(processor, user_text, system_prompt), assistant_text
 
 
 def log_preview_samples(dataset: "LlavaPretrainDataset", count: int = 2) -> None:
@@ -84,7 +91,11 @@ def log_preview_samples(dataset: "LlavaPretrainDataset", count: int = 2) -> None
     limit = min(count, len(dataset))
     print(f"Previewing {limit} training sample(s) after prompt templating:")
     for index in range(limit):
-        rendered_input, expected_output = _preview_record(dataset.processor, dataset.records[index])
+        rendered_input, expected_output = _preview_record(
+            dataset.processor,
+            dataset.records[index],
+            dataset.system_prompt,
+        )
         print(f"Sample {index}")
         print("Rendered input:")
         print(rendered_input)
@@ -107,10 +118,14 @@ class LlavaPretrainDataset(Dataset):
         processor: LlavaAnythingProcessor,
         max_samples: int | None = None,
         available_images_only: bool = True,
+        system_prompt: str | None = None,
     ) -> None:
         self.data_path = Path(data_path)
         self.image_folder = Path(image_folder)
         self.processor = processor
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            raise TypeError("system_prompt must be a string when provided.")
+        self.system_prompt = system_prompt or None
         records = _load_json_records(self.data_path)
         if available_images_only:
             records, skipped_count = self._filter_available_records(records)
@@ -159,7 +174,7 @@ class LlavaPretrainDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         record = self.records[index]
-        prefix, assistant_text = _preview_record(self.processor, record)
+        prefix, assistant_text = _preview_record(self.processor, record, self.system_prompt)
         eos = self.processor.tokenizer.eos_token or ""
         full_text = f"{prefix}{assistant_text}{eos}"
 
@@ -426,6 +441,7 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         processor=processor,
         max_samples=data_section.get("max_samples"),
         available_images_only=bool(data_section.get("available_images_only", True)),
+        system_prompt=data_section.get("system_prompt"),
     )
     log_preview_samples(dataset, int(logging_section.get("preview_samples", 0)))
     collator = LlavaPretrainDataCollator(processor.tokenizer)

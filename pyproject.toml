@@ -38,6 +38,9 @@ dev = [
 wandb = [
     "wandb>=0.17",
 ]
+deepspeed = [
+    "deepspeed>=0.19.1",
+]
 
 [project.scripts]
 llava-anything-build = "llava_anything.builder:main"

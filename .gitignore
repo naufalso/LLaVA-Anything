@@ -10,3 +10,5 @@ LLaVA-NeXT/
 data/
 wandb/
 checkpoints/
+logs/
+.env

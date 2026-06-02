@@ -415,6 +415,34 @@ def test_preview_sample_logging_shows_rendered_input_and_expected_output(
     assert "hello" in captured
 
 
+def test_pretrain_dataset_includes_custom_system_prompt_in_rendered_input(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+    tiny_image,
+    capsys,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    image_path = tmp_path / "image.jpg"
+    tiny_image.save(image_path)
+    data_path = tmp_path / "pretrain.json"
+    _write_pretrain_json(data_path, image_path.name)
+    system_prompt = "You are a careful visual assistant."
+    dataset = LlavaPretrainDataset(
+        data_path=data_path,
+        image_folder=tmp_path,
+        processor=processor,
+        system_prompt=system_prompt,
+    )
+
+    log_preview_samples(dataset, count=1)
+
+    captured = capsys.readouterr().out
+    assert system_prompt in captured
+    assert captured.index(system_prompt) < captured.index("<image>")
+
+
 def test_training_arguments_coerces_yaml_boolean_no_save_strategy(tmp_path: Path) -> None:
     args = _coerce_training_arguments(
         {
