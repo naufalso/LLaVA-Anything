@@ -12,3 +12,4 @@ wandb/
 checkpoints/
 logs/
 .env
+.venv*

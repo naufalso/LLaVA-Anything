@@ -373,8 +373,8 @@ requires-dist = [
     { name = "pillow", specifier = ">=10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
-    { name = "torch", specifier = ">=2.6,<2.7" },
-    { name = "torchvision", specifier = ">=0.21,<0.22" },
+    { name = "torch" },
+    { name = "torchvision" },
     { name = "transformers", specifier = ">=5.8.1" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.17" },
 ]

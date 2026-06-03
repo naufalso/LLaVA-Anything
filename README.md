@@ -91,6 +91,44 @@ Transformers 5.8 stores the image processor payload inside
 
 ## Inference
 
+For quick checkpoint testing, use the bundled inference command:
+
+```bash
+uv run llava-anything-infer checkpoints/qwen3-clip-vlm
+```
+
+By default this reads `examples/image/example-image1.jpg` and prompts with
+`Describe this image`. Override either value as needed:
+
+```bash
+uv run llava-anything-infer checkpoints/qwen3-clip-vlm \
+  --image-input examples/image/example-image2.png \
+  --prompt "What text is visible in this image?"
+```
+
+The same command can evaluate LLaVA-style JSON or JSONL records with the
+`image` and `conversations` fields used by training. Dataset mode only runs
+when both `--data-path` and `--image-folder` are provided. It evaluates 10
+records by default and prints one JSON object per record:
+
+```bash
+uv run llava-anything-infer checkpoints/qwen3-clip-vlm \
+  --data-path data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
+  --image-folder data/LLaVA-Pretrain
+```
+
+Use `--sample -1` to evaluate every record:
+
+```bash
+uv run llava-anything-infer checkpoints/qwen3-clip-vlm \
+  --data-path data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
+  --image-folder data/LLaVA-Pretrain \
+  --sample -1
+```
+
+For custom scripts, saved artifacts can also be loaded directly with
+Transformers:
+
 ```python
 import torch
 from PIL import Image
