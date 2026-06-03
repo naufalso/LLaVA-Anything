@@ -109,8 +109,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         orig_height, orig_width = [int(value) for value in image_size]
         height, width = self._processed_image_size()
         best_height, best_width = select_best_resolution([orig_height, orig_width], self.image_grid_pinpoints)
-        scale_height = best_height // height
-        scale_width = best_width // width
+        scale_height = (best_height + height - 1) // height
+        scale_width = (best_width + width - 1) // width
         patches_height = height // self.patch_size
         patches_width = width // self.patch_size
         unpadded_features, newline_features = self._get_unpadded_features(

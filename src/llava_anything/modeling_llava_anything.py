@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -111,7 +114,7 @@ def get_anyres_image_grid_shape(image_size: Any, grid_pinpoints: list[list[int]]
     if not isinstance(grid_pinpoints, list):
         raise TypeError("grid_pinpoints should be a list of [height, width] pairs.")
     best_height, best_width = select_best_resolution(_as_image_size(image_size), grid_pinpoints)
-    return best_height // patch_size, best_width // patch_size
+    return (best_height + patch_size - 1) // patch_size, (best_width + patch_size - 1) // patch_size
 
 
 def image_size_to_num_patches(image_size: Any, grid_pinpoints: list[list[int]], patch_size: int) -> int:
@@ -186,6 +189,95 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
     _supports_flash_attn = True
     _supports_sdpa = True
     _skip_keys_device_placement = "past_key_values"
+
+    _legacy_llava_next_key_mapping = {
+        r"^model\.vision_tower\.vision_tower\.vision_model\.(.*)$": r"vision_tower.\1",
+        r"^model\.mm_projector\.(.*)$": r"multi_modal_projector.layers.\1",
+        r"^model\.image_newline$": "image_newline",
+        r"^lm_head\.weight$": "language_model.lm_head.weight",
+        r"^model\.(?!(vision_tower|mm_projector|image_newline)$)(.*)$": r"language_model.model.\2",
+    }
+
+    @staticmethod
+    def _remap_legacy_llava_next_key(key: str) -> str:
+        if key.startswith("model.vision_tower.vision_tower.vision_model."):
+            return "vision_tower." + key.removeprefix("model.vision_tower.vision_tower.vision_model.")
+        if key.startswith("model.mm_projector."):
+            return "multi_modal_projector.layers." + key.removeprefix("model.mm_projector.")
+        if key == "model.image_newline":
+            return "image_newline"
+        if key == "lm_head.weight":
+            return "language_model.lm_head.weight"
+        if key.startswith("model."):
+            return "language_model." + key
+        return key
+
+    @classmethod
+    def _fix_state_dict_key_on_load(cls, key: str) -> tuple[str, bool]:
+        remapped_key = cls._remap_legacy_llava_next_key(key)
+        return remapped_key, remapped_key != key
+
+    @classmethod
+    def _remap_legacy_llava_next_state_dict(cls, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        remapped = OrderedDict((cls._remap_legacy_llava_next_key(key), value) for key, value in state_dict.items())
+        if hasattr(state_dict, "_metadata"):
+            remapped._metadata = state_dict._metadata  # type: ignore[attr-defined]
+        return remapped
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True, assign: bool = False):
+        if any(
+            key.startswith("model.mm_projector.")
+            or key.startswith("model.vision_tower.vision_tower.")
+            or key == "model.image_newline"
+            for key in state_dict
+        ):
+            state_dict = self._remap_legacy_llava_next_state_dict(state_dict)
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            return super().load_state_dict(state_dict, strict=strict)
+
+    @staticmethod
+    def _checkpoint_config_flag(pretrained_model_name_or_path: str | Path) -> bool:
+        try:
+            config_path = Path(pretrained_model_name_or_path) / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (TypeError, OSError, ValueError):
+            return False
+        return bool(config.get("legacy_llava_next_checkpoint", False))
+
+    @staticmethod
+    def _checkpoint_has_legacy_llava_next_keys(pretrained_model_name_or_path: str | Path) -> bool:
+        try:
+            model_path = Path(pretrained_model_name_or_path)
+        except TypeError:
+            return False
+        index_path = model_path / "model.safetensors.index.json"
+        if not index_path.exists():
+            return False
+        try:
+            weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map", {})
+        except (OSError, ValueError):
+            return False
+        return any(
+            key.startswith("model.mm_projector.")
+            or key.startswith("model.vision_tower.vision_tower.vision_model.")
+            or key == "model.image_newline"
+            for key in weight_map
+        )
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path | None, *model_args: Any, **kwargs: Any):
+        if (
+            pretrained_model_name_or_path is not None
+            and kwargs.get("key_mapping") is None
+            and (
+                cls._checkpoint_config_flag(pretrained_model_name_or_path)
+                or cls._checkpoint_has_legacy_llava_next_keys(pretrained_model_name_or_path)
+            )
+        ):
+            kwargs["key_mapping"] = dict(cls._legacy_llava_next_key_mapping)
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     def __init__(
         self,
@@ -366,6 +458,11 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
                     self.config.image_grid_pinpoints,
                     image_size,
                 )
+                if num_patch_height * num_patch_width != highres_feature.shape[0]:
+                    raise ValueError(
+                        "Image feature grid does not match the processed patch count. "
+                        f"grid={num_patch_height}x{num_patch_width}, features={tuple(highres_feature.shape)}."
+                    )
                 expected_patch_tokens = patch_grid_height * patch_grid_width
                 if highres_feature.shape[1] != expected_patch_tokens:
                     raise ValueError(

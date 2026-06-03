@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,10 @@ def main() -> None:
         model_kwargs["torch_dtype"] = args.torch_dtype
     if args.device_map:
         model_kwargs["device_map"] = args.device_map
+    # Check if flash attention is available and set the flag accordingly
+    if importlib.util.find_spec("flash_attn") is not None:
+        print("Flash attention is available. Using flash attention 2 for inference.")
+        model_kwargs["attn_implementation"] = "flash_attention_2"
 
     processor = AutoProcessor.from_pretrained(args.model_path)
     model = AutoModelForImageTextToText.from_pretrained(args.model_path, **model_kwargs)
