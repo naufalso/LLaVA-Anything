@@ -28,6 +28,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         chat_template: str | None = None,
         **kwargs: Any,
     ) -> None:
+        """Create a paired image/text processor with image-token expansion settings."""
+
         if image_mode not in {"fixed", "anyres"}:
             raise ValueError(f"image_mode must be 'fixed' or 'anyres', got {image_mode!r}.")
         self.image_token = image_token
@@ -41,6 +43,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self) -> list[str]:
+        """Return tokenizer inputs plus image tensors expected by the model."""
+
         names = list(getattr(self.tokenizer, "model_input_names", ["input_ids", "attention_mask"]))
         if "pixel_values" not in names:
             names.append("pixel_values")
@@ -49,6 +53,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return names
 
     def _processed_image_size(self) -> tuple[int, int]:
+        """Infer the image processor's target height and width."""
+
         size = getattr(self.image_processor, "crop_size", None) or getattr(self.image_processor, "size", None)
         if size is None:
             raise ValueError("image processor size is required for image-token expansion.")
@@ -62,6 +68,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return int(height), int(width)
 
     def _num_fixed_image_tokens(self) -> int:
+        """Compute the number of tokens occupied by one fixed-resolution image."""
+
         if self.image_seq_length is not None:
             return self.image_seq_length
 
@@ -82,6 +90,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         scale_height: int,
         scale_width: int,
     ) -> tuple[int, int]:
+        """Compute feature and newline-token counts after removing padding."""
+
         current_height = patches_height * scale_height
         current_width = patches_width * scale_width
 
@@ -101,6 +111,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return unpadded_features, newline_features
 
     def _num_anyres_image_tokens(self, image_size: Iterable[int]) -> int:
+        """Compute the token count for one image in any-resolution mode."""
+
         if self.patch_size is None:
             raise ValueError("patch_size is required for any-resolution image-token expansion.")
         if self.image_grid_pinpoints is None:
@@ -128,6 +140,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return tokens
 
     def _num_image_tokens(self, image_size: Iterable[int] | None = None) -> int:
+        """Dispatch image-token counting based on fixed or any-resolution mode."""
+
         if self.image_mode == "anyres":
             if image_size is None:
                 raise ValueError("image sizes are required to expand image tokens in any-resolution mode.")
@@ -135,6 +149,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return self._num_fixed_image_tokens()
 
     def _expand_image_tokens(self, text: str, image_sizes: Iterable[Iterable[int]] | None = None) -> str:
+        """Replace each image marker with the exact number of model image tokens."""
+
         placeholder = "<llava_anything_image_placeholder>"
         image_size_iter = iter(image_sizes or [])
         while self.image_token in text:
@@ -144,12 +160,16 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return text.replace(placeholder, self.image_token)
 
     def _image_from_content_item(self, item: dict[str, Any]) -> Any | None:
+        """Extract an image reference from a chat content item."""
+
         for key in ("image", "url", "path"):
             if key in item:
                 return item[key]
         return None
 
     def _normalize_content_and_images(self, content: Any) -> tuple[str, list[Any]]:
+        """Convert mixed chat content into plain text plus extracted image references."""
+
         if isinstance(content, str):
             return content, []
         if not isinstance(content, list):
@@ -170,10 +190,14 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return "\n".join(part for part in parts if part), images
 
     def _normalize_content(self, content: Any) -> str:
+        """Convert chat content into the plain text expected by chat templates."""
+
         text, _ = self._normalize_content_and_images(content)
         return text
 
     def _normalize_conversation_and_images(self, conversation: Any) -> tuple[Any, list[Any]]:
+        """Normalize a conversation and collect image references embedded in messages."""
+
         if not isinstance(conversation, list):
             return conversation, []
         normalized = []
@@ -190,10 +214,14 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return normalized, images
 
     def _normalize_conversation(self, conversation: Any) -> Any:
+        """Normalize conversation content while discarding extracted image references."""
+
         normalized, _ = self._normalize_conversation_and_images(conversation)
         return normalized
 
     def _processor_kwargs_from_chat_template_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pop processor-specific kwargs from chat-template kwargs."""
+
         processor_kwargs = kwargs.pop("processor_kwargs", None) or {}
         if not isinstance(processor_kwargs, dict):
             raise TypeError("processor_kwargs must be a mapping when provided.")
@@ -206,10 +234,14 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return_tensors: str | None,
         processor_kwargs: dict[str, Any],
     ) -> BatchFeature:
+        """Tokenize rendered chat text and process any images extracted from the conversation."""
+
         image_inputs = images if images else None
         return self(images=image_inputs, text=rendered, return_tensors=return_tensors, **processor_kwargs)
 
     def apply_chat_template(self, conversation: Any, *args: Any, **kwargs: Any) -> Any:
+        """Render or tokenize a chat conversation with multimodal content support."""
+
         kwargs = dict(kwargs)
         tokenize = bool(kwargs.get("tokenize", False))
         return_dict = bool(kwargs.get("return_dict", False))
@@ -244,16 +276,22 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return rendered
 
     def _as_image_list(self, images: Any) -> list[Any]:
+        """Normalize one or many image inputs into a list."""
+
         if isinstance(images, (list, tuple)):
             return list(images)
         return [images]
 
     def _as_pil_image(self, image: Any) -> Image.Image:
+        """Validate and convert an any-resolution image input to RGB PIL form."""
+
         if not isinstance(image, Image.Image):
             raise TypeError("Any-resolution preprocessing currently expects PIL.Image inputs.")
         return image.convert("RGB")
 
     def _resize_and_pad(self, image: Image.Image, target_height: int, target_width: int) -> Image.Image:
+        """Resize an image preserving aspect ratio and pad it to the target canvas."""
+
         width, height = image.size
         scale = min(target_width / width, target_height / height)
         resized_width = int(round(width * scale))
@@ -266,6 +304,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return canvas
 
     def _divide_to_patches(self, image: Image.Image, patch_height: int, patch_width: int) -> list[Image.Image]:
+        """Split an image into a row-major list of non-overlapping patches."""
+
         width, height = image.size
         patches = []
         for top in range(0, height, patch_height):
@@ -279,6 +319,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return_tensors: str | None,
         image_kwargs: dict[str, Any],
     ) -> BatchFeature:
+        """Preprocess any-resolution images into padded patch stacks and original sizes."""
+
         if self.image_grid_pinpoints is None:
             raise ValueError("image_grid_pinpoints is required when image_mode='anyres'.")
         image_height, image_width = self._processed_image_size()
@@ -324,6 +366,8 @@ class LlavaAnythingProcessor(ProcessorMixin):
         return_tensors: str | None = None,
         **kwargs: Any,
     ) -> BatchFeature:
+        """Process images and/or text into model-ready tensors."""
+
         if images is None and text is None:
             raise ValueError("You must provide images, text, or both.")
 

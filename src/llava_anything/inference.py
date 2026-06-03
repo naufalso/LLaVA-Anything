@@ -23,6 +23,8 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 def _torch_dtype(value: str) -> torch.dtype | str | None:
+    """Parse a command-line torch dtype value."""
+
     if value == "auto":
         return "auto"
     if value in {"none", "None"}:
@@ -34,10 +36,14 @@ def _torch_dtype(value: str) -> torch.dtype | str | None:
 
 
 def _load_image(path: str | Path) -> Image.Image:
+    """Load an image path as RGB PIL data."""
+
     return Image.open(Path(path)).convert("RGB")
 
 
 def _render_prompt(processor: Any, prompt: str, system_prompt: str | None = None) -> str:
+    """Render a user prompt into the chat format expected by the processor."""
+
     image_token = getattr(processor, "image_token", "<image>")
     content: str | list[dict[str, str]]
     if image_token in prompt:
@@ -55,11 +61,15 @@ def _render_prompt(processor: Any, prompt: str, system_prompt: str | None = None
 
 
 def _record_prompt(record: dict[str, Any]) -> str:
+    """Extract the user prompt from an evaluation record."""
+
     user_text, _ = _conversation_text(record)
     return user_text
 
 
 def _record_image_path(record: dict[str, Any], image_folder: str | Path) -> Path:
+    """Resolve the image path for an evaluation record."""
+
     image_name = record.get("image")
     if not image_name:
         raise ValueError("Evaluation records must include an image path.")
@@ -67,10 +77,14 @@ def _record_image_path(record: dict[str, Any], image_folder: str | Path) -> Path
 
 
 def _move_inputs_to_device(inputs: Any, device: torch.device | str) -> Any:
+    """Move processor outputs to the model device."""
+
     return inputs.to(device)
 
 
 def _decode_generated_text(processor: Any, output: torch.Tensor, input_length: int) -> str:
+    """Decode only the newly generated token ids from a generation output."""
+
     generated_ids = output[input_length:]
     return processor.decode(generated_ids, skip_special_tokens=True).strip()
 
@@ -83,6 +97,8 @@ def generate_response(
     system_prompt: str | None = None,
     max_new_tokens: int = 128,
 ) -> str:
+    """Generate a deterministic text response for one image and prompt."""
+
     rendered_prompt = _render_prompt(processor, prompt, system_prompt)
     inputs = processor(images=image, text=rendered_prompt, return_tensors="pt")
     inputs = _move_inputs_to_device(inputs, model.device)
@@ -94,6 +110,8 @@ def generate_response(
 
 
 def run_single_image(args: argparse.Namespace, model: Any, processor: Any) -> None:
+    """Run inference for one image/prompt pair and print the response."""
+
     result = generate_response(
         model=model,
         processor=processor,
@@ -106,6 +124,8 @@ def run_single_image(args: argparse.Namespace, model: Any, processor: Any) -> No
 
 
 def run_dataset(args: argparse.Namespace, model: Any, processor: Any) -> None:
+    """Run inference for a JSON/JSONL dataset and print one JSON result per record."""
+
     records = _load_json_records(args.data_path)
     if args.sample >= 0:
         records = records[: args.sample]
@@ -142,6 +162,8 @@ def run_dataset(args: argparse.Namespace, model: Any, processor: Any) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the inference utility."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_path", type=Path, help="Directory containing a saved LLaVa-Anything model.")
     parser.add_argument("--image-input", type=Path, default=Path("examples/image/example-image1.jpg"))
@@ -157,6 +179,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI entry point for loading a checkpoint and running inference."""
+
     args = parse_args()
     model_kwargs = {}
     if args.torch_dtype is not None:

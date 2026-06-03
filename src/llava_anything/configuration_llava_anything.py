@@ -40,6 +40,8 @@ class LlavaAnythingConfig(PretrainedConfig):
         vision_trust_remote_code: bool | None = None,
         **kwargs: Any,
     ) -> None:
+        """Initialize nested text/vision configs and multimodal connector settings."""
+
         super().__init__(**kwargs)
 
         self.text_config = self._coerce_config(text_config, default_model_type="llama")
@@ -72,6 +74,8 @@ class LlavaAnythingConfig(PretrainedConfig):
         config: dict[str, Any] | PretrainedConfig | None,
         default_model_type: str,
     ) -> PretrainedConfig:
+        """Convert a dict or missing config into a concrete Transformers config."""
+
         if isinstance(config, PretrainedConfig):
             return config
         if config is None:
@@ -94,9 +98,13 @@ class LlavaAnythingConfig(PretrainedConfig):
         vision_config: PretrainedConfig,
         **kwargs: Any,
     ) -> "LlavaAnythingConfig":
+        """Build a LLaVa-Anything config from existing text and vision configs."""
+
         return cls(text_config=text_config, vision_config=vision_config, **kwargs)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the composite config with nested text and vision config dictionaries."""
+
         output = super().to_dict()
         output["text_config"] = self.text_config.to_dict()
         output["vision_config"] = self.vision_config.to_dict()
@@ -104,4 +112,3 @@ class LlavaAnythingConfig(PretrainedConfig):
 
 
 __all__ = ["LlavaAnythingConfig"]
-

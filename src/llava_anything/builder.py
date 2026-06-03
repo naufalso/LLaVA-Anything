@@ -15,6 +15,8 @@ from .processing_llava_anything import LlavaAnythingProcessor
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
+    """Load a YAML file and require its top-level value to be a mapping."""
+
     with Path(path).open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
@@ -23,6 +25,8 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return a named YAML section, defaulting to an empty mapping."""
+
     value = data.get(key, {})
     if not isinstance(value, dict):
         raise ValueError(f"Expected '{key}' to be a mapping.")
@@ -38,6 +42,8 @@ def _extract_vision_config(config: Any) -> Any:
 
 
 def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
+    """Construct a model config from a parsed LLaVa-Anything YAML mapping."""
+
     model_section = _section(data, "model")
     text_section = _section(data, "text_model")
     vision_section = _section(data, "vision_model")
@@ -99,10 +105,14 @@ def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
 
 
 def config_from_yaml(path: str | Path) -> LlavaAnythingConfig:
+    """Load YAML from disk and convert it into a LLaVa-Anything config."""
+
     return config_from_yaml_dict(load_yaml(path))
 
 
 def _token_in_vocab(tokenizer: Any, token: str) -> bool:
+    """Return whether a tokenizer already knows a token."""
+
     try:
         return token in tokenizer.get_vocab()
     except AttributeError:
@@ -110,6 +120,8 @@ def _token_in_vocab(tokenizer: Any, token: str) -> bool:
 
 
 def processor_from_yaml_dict(data: dict[str, Any], config: LlavaAnythingConfig) -> LlavaAnythingProcessor:
+    """Build a processor and synchronize tokenizer image-token metadata with the config."""
+
     text_section = _section(data, "text_model")
     vision_section = _section(data, "vision_model")
     tokenizer_section = _section(text_section, "tokenizer")
@@ -153,6 +165,8 @@ def processor_from_yaml_dict(data: dict[str, Any], config: LlavaAnythingConfig) 
 
 
 def processor_from_yaml(path: str | Path, config: LlavaAnythingConfig | None = None) -> LlavaAnythingProcessor:
+    """Load YAML from disk and build a matching LLaVa-Anything processor."""
+
     data = load_yaml(path)
     config = config or config_from_yaml_dict(data)
     return processor_from_yaml_dict(data, config)
@@ -164,6 +178,8 @@ def model_from_yaml_dict(
     load_pretrained_components: bool = False,
     model_kwargs: dict[str, Any] | None = None,
 ) -> LlavaAnythingForConditionalGeneration:
+    """Build a model from YAML data, optionally loading pretrained component weights."""
+
     if not load_pretrained_components:
         return LlavaAnythingForConditionalGeneration(config)
 
@@ -190,6 +206,8 @@ def save_from_yaml(
     load_pretrained_components: bool = False,
     model_kwargs: dict[str, Any] | None = None,
 ) -> None:
+    """Materialize config, processor, and optionally model weights into an output directory."""
+
     data = load_yaml(yaml_path)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -220,6 +238,8 @@ def save_from_yaml(
 
 
 def main() -> None:
+    """CLI entry point for building LLaVa-Anything artifacts from YAML."""
+
     parser = argparse.ArgumentParser(description="Build a LLaVa-Anything config/processor from YAML.")
     parser.add_argument("yaml_path", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)

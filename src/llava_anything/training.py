@@ -25,6 +25,8 @@ IGNORE_INDEX = -100
 
 
 def _load_json_records(path: str | Path) -> list[dict[str, Any]]:
+    """Load JSON or JSONL training records from disk."""
+
     path = Path(path)
     if path.suffix == ".jsonl":
         with path.open("r", encoding="utf-8") as handle:
@@ -38,6 +40,8 @@ def _load_json_records(path: str | Path) -> list[dict[str, Any]]:
 
 
 def _role_name(raw_role: str) -> str:
+    """Normalize dataset role labels to chat-template role names."""
+
     role = raw_role.lower()
     if role in {"human", "user"}:
         return "user"
@@ -47,6 +51,8 @@ def _role_name(raw_role: str) -> str:
 
 
 def _conversation_text(record: dict[str, Any]) -> tuple[str, str]:
+    """Extract the first user prompt and assistant response from a record."""
+
     conversations = record.get("conversations")
     if not isinstance(conversations, list):
         raise ValueError("Each record must contain a conversations list.")
@@ -69,6 +75,8 @@ def _conversation_text(record: dict[str, Any]) -> tuple[str, str]:
 
 
 def _render_prefix(processor: LlavaAnythingProcessor, user_text: str, system_prompt: str | None = None) -> str:
+    """Render the supervised-learning prompt prefix before assistant tokens."""
+
     conversation = []
     if system_prompt:
         conversation.append({"role": "system", "content": system_prompt})
@@ -81,11 +89,15 @@ def _preview_record(
     record: dict[str, Any],
     system_prompt: str | None = None,
 ) -> tuple[str, str]:
+    """Render a record into prompt prefix and target assistant text."""
+
     user_text, assistant_text = _conversation_text(record)
     return _render_prefix(processor, user_text, system_prompt), assistant_text
 
 
 def log_preview_samples(dataset: "LlavaPretrainDataset", count: int = 2) -> None:
+    """Print a small preview of templated training samples."""
+
     if count <= 0:
         return
     limit = min(count, len(dataset))
@@ -104,6 +116,8 @@ def log_preview_samples(dataset: "LlavaPretrainDataset", count: int = 2) -> None
 
 
 def _tokenize_text(processor: LlavaAnythingProcessor, text: str) -> torch.LongTensor:
+    """Tokenize text without adding tokenizer-level special tokens."""
+
     encoded = processor(text=text, return_tensors="pt", add_special_tokens=False)
     return encoded["input_ids"][0]
 
@@ -120,6 +134,8 @@ class LlavaPretrainDataset(Dataset):
         available_images_only: bool = True,
         system_prompt: str | None = None,
     ) -> None:
+        """Load record metadata and optionally filter examples missing image files."""
+
         self.data_path = Path(data_path)
         self.image_folder = Path(image_folder)
         self.processor = processor
@@ -141,15 +157,21 @@ class LlavaPretrainDataset(Dataset):
         self.records = records
 
     def __len__(self) -> int:
+        """Return the number of available training records."""
+
         return len(self.records)
 
     def _record_image_path(self, record: dict[str, Any]) -> Path:
+        """Resolve a record's image path relative to the dataset image folder."""
+
         image_name = record.get("image")
         if not image_name:
             raise ValueError("Pretraining records must include an image path.")
         return self.image_folder / str(image_name)
 
     def _record_has_available_image(self, record: dict[str, Any]) -> bool:
+        """Return whether a record points to an existing image file."""
+
         image_name = record.get("image")
         if not image_name:
             return False
@@ -159,6 +181,8 @@ class LlavaPretrainDataset(Dataset):
         self,
         records: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
+        """Keep records with existing images and count skipped examples."""
+
         available: list[dict[str, Any]] = []
         skipped_count = 0
         for record in records:
@@ -169,10 +193,14 @@ class LlavaPretrainDataset(Dataset):
         return available, skipped_count
 
     def _load_image(self, record: dict[str, Any]) -> Image.Image:
+        """Load a record image as RGB PIL data."""
+
         image_path = self._record_image_path(record)
         return Image.open(image_path).convert("RGB")
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        """Build one supervised multimodal training sample."""
+
         record = self.records[index]
         prefix, assistant_text = _preview_record(self.processor, record, self.system_prompt)
         eos = self.processor.tokenizer.eos_token or ""
@@ -209,6 +237,8 @@ class LlavaPretrainDataCollator:
     tokenizer: Any
 
     def _pad_sequence(self, tensors: list[torch.Tensor], padding_value: int) -> torch.Tensor:
+        """Pad token sequences while respecting the tokenizer padding side."""
+
         if getattr(self.tokenizer, "padding_side", "right") == "left":
             tensors = [torch.flip(tensor, dims=[0]) for tensor in tensors]
             padded = pad_sequence(tensors, batch_first=True, padding_value=padding_value)
@@ -216,6 +246,8 @@ class LlavaPretrainDataCollator:
         return pad_sequence(tensors, batch_first=True, padding_value=padding_value)
 
     def __call__(self, instances: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        """Collate token, label, image, and optional image-size tensors into a batch."""
+
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
@@ -252,6 +284,8 @@ class LlavaPretrainDataCollator:
 
 
 def apply_trainable_modules(model: LlavaAnythingForConditionalGeneration, trainable_modules: str = "projector") -> list[str]:
+    """Freeze all parameters except the requested trainable module groups."""
+
     modules = {part.strip() for part in trainable_modules.split(",") if part.strip()}
     supported = {"projector", "vision_tower", "language_model", "full"}
     unknown = modules - supported
@@ -279,6 +313,8 @@ class LlavaPretrainingResult:
 
 
 def configure_wandb(training_section: dict[str, Any], wandb_section: dict[str, Any] | None) -> None:
+    """Apply optional Weights & Biases settings to training args and environment variables."""
+
     if wandb_section is None:
         return
 
@@ -308,6 +344,8 @@ def configure_wandb(training_section: dict[str, Any], wandb_section: dict[str, A
 
 
 def _coerce_training_arguments(training_section: dict[str, Any]) -> TrainingArguments:
+    """Convert a YAML training section into Hugging Face TrainingArguments."""
+
     kwargs = dict(training_section)
     kwargs.setdefault("remove_unused_columns", False)
     kwargs.setdefault("report_to", [])
@@ -322,6 +360,8 @@ def _coerce_training_arguments(training_section: dict[str, Any]) -> TrainingArgu
 
 
 def _load_training_yaml(path: str | Path) -> dict[str, Any]:
+    """Load a training YAML file and require a top-level mapping."""
+
     with Path(path).open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
@@ -330,6 +370,8 @@ def _load_training_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def _coerce_torch_dtype(value: Any) -> Any:
+    """Convert string dtype names into torch dtype objects when possible."""
+
     if not isinstance(value, str) or value == "auto":
         return value
     if hasattr(torch, value):
@@ -340,6 +382,8 @@ def _coerce_torch_dtype(value: Any) -> Any:
 
 
 def _coerce_model_kwargs(model_kwargs: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Recursively coerce model-loading dtype kwargs from YAML-friendly strings."""
+
     if model_kwargs is None:
         return None
     coerced = dict(model_kwargs)
@@ -357,6 +401,8 @@ def _build_model_and_processor(
     load_pretrained_components: bool = True,
     model_kwargs: dict[str, Any] | None = None,
 ) -> tuple[LlavaAnythingForConditionalGeneration, LlavaAnythingProcessor]:
+    """Build model and processor from a model YAML, resizing embeddings if needed."""
+
     model_data = load_yaml(model_yaml)
     config = config_from_yaml_dict(model_data)
     processor = processor_from_yaml_dict(model_data, config)
@@ -384,6 +430,8 @@ def _load_checkpoint_model_and_processor(
     model_checkpoint: str | Path,
     model_kwargs: dict[str, Any] | None = None,
 ) -> tuple[LlavaAnythingForConditionalGeneration, LlavaAnythingProcessor]:
+    """Load a saved LLaVa-Anything checkpoint and its processor."""
+
     checkpoint = Path(model_checkpoint)
     processor = LlavaAnythingProcessor.from_pretrained(checkpoint)
     model = LlavaAnythingForConditionalGeneration.from_pretrained(
@@ -394,6 +442,8 @@ def _load_checkpoint_model_and_processor(
 
 
 def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
+    """Run the full pretraining loop described by a YAML configuration."""
+
     data = _load_training_yaml(path)
     model_yaml = data.get("model_yaml")
     model_checkpoint = data.get("model_checkpoint")
@@ -466,6 +516,8 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
 
 
 def main() -> None:
+    """CLI entry point for running LLaVa-Anything pretraining from YAML."""
+
     parser = argparse.ArgumentParser(description="Run LLaVa-Anything training from a YAML config.")
     parser.add_argument("training_yaml", type=Path)
     args = parser.parse_args()

@@ -37,6 +37,8 @@ class LlavaAnythingCausalLMOutputWithPast(ModelOutput):
 
 
 def _default_return_dict_from_config(config: Any) -> bool:
+    """Read the return-dict preference from configs across Transformers versions."""
+
     missing = object()
     return_dict = getattr(config, "return_dict", missing)
     if return_dict is not missing:
@@ -45,6 +47,8 @@ def _default_return_dict_from_config(config: Any) -> bool:
 
 
 def _is_expected_ignored_vision_key(key: str) -> bool:
+    """Return whether an unused vision checkpoint key is expected for CLIP-style models."""
+
     return key.startswith("text_model.") or key in {
         "logit_scale",
         "text_projection.weight",
@@ -53,6 +57,8 @@ def _is_expected_ignored_vision_key(key: str) -> bool:
 
 
 def _format_key_examples(keys: list[str], *, limit: int = 6) -> list[str]:
+    """Format a short bullet list of checkpoint key examples."""
+
     examples = keys[:limit]
     lines = [f"  - {key}" for key in examples]
     remaining = len(keys) - len(examples)
@@ -66,6 +72,8 @@ def _format_component_load_report(
     model_name_or_path: str,
     loading_info: dict[str, Any] | None,
 ) -> str | None:
+    """Build a human-readable report for partial component checkpoint loading."""
+
     if not loading_info:
         return None
 
@@ -101,6 +109,8 @@ def _format_component_load_report(
 
 
 def _as_image_size(image_size: Any) -> list[int]:
+    """Normalize an image-size object to a two-integer ``[height, width]`` list."""
+
     if isinstance(image_size, (list, tuple)):
         return [int(image_size[0]), int(image_size[1])]
     if isinstance(image_size, torch.Tensor):
@@ -111,6 +121,8 @@ def _as_image_size(image_size: Any) -> list[int]:
 
 
 def get_anyres_image_grid_shape(image_size: Any, grid_pinpoints: list[list[int]], patch_size: int) -> tuple[int, int]:
+    """Return the selected any-resolution grid shape in patch units."""
+
     if not isinstance(grid_pinpoints, list):
         raise TypeError("grid_pinpoints should be a list of [height, width] pairs.")
     best_height, best_width = select_best_resolution(_as_image_size(image_size), grid_pinpoints)
@@ -118,6 +130,8 @@ def get_anyres_image_grid_shape(image_size: Any, grid_pinpoints: list[list[int]]
 
 
 def image_size_to_num_patches(image_size: Any, grid_pinpoints: list[list[int]], patch_size: int) -> int:
+    """Return the number of any-resolution image crops, including the base image."""
+
     if not isinstance(grid_pinpoints, list):
         raise TypeError("grid_pinpoints should be a list of [height, width] pairs.")
     best_height, best_width = select_best_resolution(_as_image_size(image_size), grid_pinpoints)
@@ -125,6 +139,8 @@ def image_size_to_num_patches(image_size: Any, grid_pinpoints: list[list[int]], 
 
 
 def unpad_image(tensor: torch.Tensor, original_size: Any) -> torch.Tensor:
+    """Remove aspect-ratio padding from a feature map using the original image size."""
+
     original_height, original_width = _as_image_size(original_size)
     current_height, current_width = tensor.shape[1:]
 
@@ -144,11 +160,15 @@ def unpad_image(tensor: torch.Tensor, original_size: Any) -> torch.Tensor:
 
 class IdentityProjector(nn.Module):
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        """Return image features unchanged."""
+
         return image_features
 
 
 class LlavaAnythingMultiModalProjector(nn.Module):
     def __init__(self, config: LlavaAnythingConfig) -> None:
+        """Create the configured multimodal projector between vision and text dimensions."""
+
         super().__init__()
         vision_hidden_size = getattr(config.vision_config, "hidden_size", None)
         text_hidden_size = getattr(config.text_config, "hidden_size", None)
@@ -177,6 +197,8 @@ class LlavaAnythingMultiModalProjector(nn.Module):
             self.layers = nn.Sequential(*layers)
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        """Project vision features into the language-model embedding space."""
+
         return self.layers(image_features)
 
 
@@ -200,6 +222,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def _remap_legacy_llava_next_key(key: str) -> str:
+        """Map legacy LLaVA-NeXT checkpoint keys to this model's module names."""
+
         if key.startswith("model.vision_tower.vision_tower.vision_model."):
             return "vision_tower." + key.removeprefix("model.vision_tower.vision_tower.vision_model.")
         if key.startswith("model.mm_projector."):
@@ -214,17 +238,23 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     @classmethod
     def _fix_state_dict_key_on_load(cls, key: str) -> tuple[str, bool]:
+        """Return a remapped state-dict key and whether it changed."""
+
         remapped_key = cls._remap_legacy_llava_next_key(key)
         return remapped_key, remapped_key != key
 
     @classmethod
     def _remap_legacy_llava_next_state_dict(cls, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Remap every legacy state-dict key while preserving loader metadata."""
+
         remapped = OrderedDict((cls._remap_legacy_llava_next_key(key), value) for key, value in state_dict.items())
         if hasattr(state_dict, "_metadata"):
             remapped._metadata = state_dict._metadata  # type: ignore[attr-defined]
         return remapped
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True, assign: bool = False):
+        """Load weights, automatically remapping supported legacy LLaVA-NeXT keys."""
+
         if any(
             key.startswith("model.mm_projector.")
             or key.startswith("model.vision_tower.vision_tower.")
@@ -239,6 +269,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def _checkpoint_config_flag(pretrained_model_name_or_path: str | Path) -> bool:
+        """Check whether a checkpoint config declares legacy key compatibility."""
+
         try:
             config_path = Path(pretrained_model_name_or_path) / "config.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -248,6 +280,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def _checkpoint_has_legacy_llava_next_keys(pretrained_model_name_or_path: str | Path) -> bool:
+        """Inspect a safetensors index for legacy LLaVA-NeXT key patterns."""
+
         try:
             model_path = Path(pretrained_model_name_or_path)
         except TypeError:
@@ -268,6 +302,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | Path | None, *model_args: Any, **kwargs: Any):
+        """Load a checkpoint, installing key remapping when legacy weights are detected."""
+
         if (
             pretrained_model_name_or_path is not None
             and kwargs.get("key_mapping") is None
@@ -286,6 +322,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         vision_tower: PreTrainedModel | None = None,
         init_weights: bool = True,
     ) -> None:
+        """Initialize the vision tower, language model, projector, and newline embedding."""
+
         super().__init__(config)
         self.vision_tower = vision_tower if vision_tower is not None else AutoModel.from_config(config.vision_config)
         self.language_model = (
@@ -304,10 +342,14 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     @property
     def device(self) -> torch.device:
+        """Return the device of the model input embeddings."""
+
         return self.get_input_embeddings().weight.device
 
     @property
     def dtype(self) -> torch.dtype:
+        """Return the dtype of the model input embeddings."""
+
         return self.get_input_embeddings().weight.dtype
 
     @classmethod
@@ -320,6 +362,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         text_model_kwargs: dict[str, Any] | None = None,
         vision_model_kwargs: dict[str, Any] | None = None,
     ) -> "LlavaAnythingForConditionalGeneration":
+        """Assemble a LLaVa-Anything model from separate pretrained text and vision models."""
+
         text_model_kwargs = dict(text_model_kwargs or {})
         vision_model_kwargs = dict(vision_model_kwargs or {})
         if config is None:
@@ -378,29 +422,43 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         return cls(config, language_model=language_model, vision_tower=vision_tower, init_weights=False)
 
     def get_input_embeddings(self) -> nn.Module:
+        """Return the language model's input embedding module."""
+
         return self.language_model.get_input_embeddings()
 
     def set_input_embeddings(self, value: nn.Module) -> None:
+        """Replace the language model's input embedding module."""
+
         self.language_model.set_input_embeddings(value)
 
     def get_output_embeddings(self) -> nn.Module | None:
+        """Return the language model's output embedding module, when available."""
+
         return self.language_model.get_output_embeddings()
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        """Replace the language model's output embedding module."""
+
         self.language_model.set_output_embeddings(new_embeddings)
 
     def get_decoder(self) -> nn.Module:
+        """Return the decoder module used by the wrapped language model."""
+
         if hasattr(self.language_model, "get_decoder"):
             return self.language_model.get_decoder()
         return self.language_model
 
     def set_decoder(self, decoder: nn.Module) -> None:
+        """Replace the wrapped language model decoder when the backend supports it."""
+
         if hasattr(self.language_model, "set_decoder"):
             self.language_model.set_decoder(decoder)
             return
         raise AttributeError(f"{self.language_model.__class__.__name__} does not expose set_decoder().")
 
     def _select_vision_features(self, vision_outputs: Any) -> torch.Tensor:
+        """Select and optionally concatenate hidden states from configured vision layers."""
+
         hidden_states = vision_outputs.hidden_states
         if hidden_states is None:
             raise ValueError("The vision tower must return hidden_states. Pass output_hidden_states=True.")
@@ -421,6 +479,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         return selected
 
     def _project_vision_outputs(self, pixel_values: torch.FloatTensor, **kwargs: Any) -> torch.Tensor:
+        """Run the vision tower and projector for a batch of image tensors."""
+
         vision_parameter = next(self.vision_tower.parameters())
         vision_outputs = self.vision_tower(
             pixel_values.to(device=vision_parameter.device, dtype=vision_parameter.dtype),
@@ -441,6 +501,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         image_features: tuple[torch.Tensor, ...],
         image_sizes: torch.LongTensor,
     ) -> torch.Tensor:
+        """Pack any-resolution crop features into a single sequence aligned to image tokens."""
+
         if self.config.image_grid_pinpoints is None:
             raise ValueError("image_grid_pinpoints is required when image_mode='anyres'.")
 
@@ -503,6 +565,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         image_sizes: torch.LongTensor | None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Extract and pack image features for any-resolution pixel-value tensors."""
+
         if image_sizes is None:
             raise ValueError("image_sizes is required when image_mode='anyres'.")
         if self.config.image_grid_pinpoints is None:
@@ -538,6 +602,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         image_sizes: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Extract projected image features for fixed or any-resolution inputs."""
+
         if getattr(self.config, "image_mode", "fixed") == "anyres":
             return self._get_anyres_image_features(pixel_values, image_sizes, **kwargs)
 
@@ -556,6 +622,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor,
         image_features: torch.FloatTensor,
     ) -> torch.FloatTensor:
+        """Replace image-token embeddings with projected vision features."""
+
         if input_ids is None:
             image_token = self.get_input_embeddings()(
                 torch.tensor(self.config.image_token_index, dtype=torch.long, device=inputs_embeds.device)
@@ -592,6 +660,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         return_dict: bool | None = None,
         **kwargs: Any,
     ) -> tuple | LlavaAnythingCausalLMOutputWithPast:
+        """Run multimodal conditional generation with optional image-feature injection."""
+
         return_dict = return_dict if return_dict is not None else _default_return_dict_from_config(self.config)
         if kwargs.get("logits_to_keep", 0) is None:
             kwargs.pop("logits_to_keep")
@@ -644,6 +714,8 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         is_first_iteration: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Prepare decoder inputs while keeping image tensors only when needed."""
+
         generation_kwargs = dict(kwargs)
         if logits_to_keep is not None:
             generation_kwargs["logits_to_keep"] = logits_to_keep
