@@ -29,7 +29,7 @@ IGNORE_INDEX = -100
 def _is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
-def _load_json_records(path: str | Path) -> list[dict[str, Any]]:
+def _load_json_records(path: str | Path, max_samples: int | None = None) -> list[dict[str, Any]]:
     """Load JSON or JSONL training records from disk."""
 
     path = Path(path)
@@ -48,6 +48,8 @@ def _load_json_records(path: str | Path) -> list[dict[str, Any]]:
                 line = line.strip()
                 if not line:
                     continue
+                if max_samples is not None and len(records) >= max_samples:
+                    break
                 try:
                     records.append(json.loads(line))
                 except json.JSONDecodeError as exc:
@@ -137,10 +139,41 @@ def log_preview_samples(dataset: "LlavaPretrainDataset", count: int = 2) -> None
         print(expected_output)
 
 
-def _tokenize_text(processor: LlavaAnythingProcessor, text: str) -> torch.LongTensor:
+_TOKENIZER_MODEL_MAX_LENGTH_SENTINEL = 10**20
+
+
+def _resolve_model_max_length(processor: LlavaAnythingProcessor, model_max_length: Any | None = None) -> int | None:
+    """Resolve the training max length from config or the tokenizer."""
+
+    if model_max_length is not None:
+        resolved = int(model_max_length)
+        if resolved <= 0:
+            raise ValueError("model_max_length must be a positive integer when provided.")
+        return resolved
+
+    tokenizer_max_length = getattr(processor.tokenizer, "model_max_length", None)
+    if tokenizer_max_length is None:
+        return None
+    try:
+        resolved = int(tokenizer_max_length)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if resolved <= 0 or resolved >= _TOKENIZER_MODEL_MAX_LENGTH_SENTINEL:
+        return None
+    return resolved
+
+
+def _tokenize_text(
+    processor: LlavaAnythingProcessor,
+    text: str,
+    model_max_length: int | None = None,
+) -> torch.LongTensor:
     """Tokenize text without adding tokenizer-level special tokens."""
 
-    encoded = processor(text=text, return_tensors="pt", add_special_tokens=False)
+    tokenizer_kwargs = {"add_special_tokens": False}
+    if model_max_length is not None:
+        tokenizer_kwargs.update({"truncation": True, "max_length": model_max_length})
+    encoded = processor(text=text, return_tensors="pt", **tokenizer_kwargs)
     return encoded["input_ids"][0]
 
 
@@ -155,16 +188,18 @@ class LlavaPretrainDataset(Dataset):
         max_samples: int | None = None,
         available_images_only: bool = True,
         system_prompt: str | None = None,
+        model_max_length: int | None = None,
     ) -> None:
         """Load record metadata and optionally filter examples with missing image files."""
 
         self.data_path = Path(data_path)
         self.image_folder = Path(image_folder)
         self.processor = processor
+        self.model_max_length = _resolve_model_max_length(processor, model_max_length)
         if system_prompt is not None and not isinstance(system_prompt, str):
             raise TypeError("system_prompt must be a string when provided.")
         self.system_prompt = system_prompt or None
-        records = _load_json_records(self.data_path)
+        records = _load_json_records(self.data_path, max_samples)
         if available_images_only:
             records, skipped_count = self._filter_available_records(records)
             if skipped_count:
@@ -227,6 +262,14 @@ class LlavaPretrainDataset(Dataset):
         image_path = self._record_image_path(record)
         return Image.open(image_path).convert("RGB")
 
+    def _tokenizer_kwargs(self) -> dict[str, Any]:
+        """Return text-tokenization kwargs used by all training samples."""
+
+        kwargs: dict[str, Any] = {"add_special_tokens": False}
+        if self.model_max_length is not None:
+            kwargs.update({"truncation": True, "max_length": self.model_max_length})
+        return kwargs
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Build one supervised training sample, with images when present."""
 
@@ -242,14 +285,14 @@ class LlavaPretrainDataset(Dataset):
 
         if has_image and getattr(self.processor, "image_mode", "fixed") == "anyres":
             image = self._load_image(record)
-            full_inputs = self.processor(images=image, text=full_text, return_tensors="pt", add_special_tokens=False)
-            prefix_inputs = self.processor(images=image, text=prefix, return_tensors="pt", add_special_tokens=False)
+            full_inputs = self.processor(images=image, text=full_text, return_tensors="pt", **self._tokenizer_kwargs())
+            prefix_inputs = self.processor(images=image, text=prefix, return_tensors="pt", **self._tokenizer_kwargs())
             input_ids = full_inputs["input_ids"][0]
             prefix_ids = prefix_inputs["input_ids"][0]
             image_inputs = full_inputs
         else:
-            input_ids = _tokenize_text(self.processor, full_text)
-            prefix_ids = _tokenize_text(self.processor, prefix)
+            input_ids = _tokenize_text(self.processor, full_text, self.model_max_length)
+            prefix_ids = _tokenize_text(self.processor, prefix, self.model_max_length)
             image_inputs = self.processor(images=self._load_image(record), return_tensors="pt") if has_image else {}
 
         labels = input_ids.clone()
@@ -520,6 +563,7 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     trainable_modules = str(training_section.get("trainable_modules", "projector"))
     training_args_data = dict(training_section)
     training_args_data.pop("trainable_modules", None)
+    model_max_length = training_args_data.pop("model_max_length", None)
     trainable_names = apply_trainable_modules(model, trainable_modules)
 
     dataset = LlavaPretrainDataset(
@@ -529,6 +573,7 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         max_samples=data_section.get("max_samples"),
         available_images_only=bool(data_section.get("available_images_only", True)),
         system_prompt=data_section.get("system_prompt"),
+        model_max_length=model_max_length,
     )
     log_preview_samples(dataset, int(logging_section.get("preview_samples", 0)))
     collator = LlavaPretrainDataCollator(processor.tokenizer)

@@ -119,6 +119,72 @@ def test_pretrain_dataset_supports_text_only_records(
     assert int((sample["labels"] != IGNORE_INDEX).sum().item()) > 0
 
 
+def test_pretrain_dataset_truncates_to_explicit_model_max_length(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    processor.tokenizer.model_max_length = 4
+    data_path = tmp_path / "long-text.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "long-text",
+                    "conversations": [
+                        {"from": "human", "value": "token_2 token_3 token_4 token_5"},
+                        {"from": "gpt", "value": "token_6 token_7 token_8 token_9 token_10 token_11"},
+                    ],
+                }
+            ]
+        )
+    )
+
+    dataset = LlavaPretrainDataset(
+        data_path=data_path,
+        image_folder=tmp_path,
+        processor=processor,
+        model_max_length=7,
+    )
+    sample = dataset[0]
+
+    assert dataset.model_max_length == 7
+    assert sample["input_ids"].shape[0] == 7
+    assert sample["labels"].shape == sample["input_ids"].shape
+
+
+def test_pretrain_dataset_infers_model_max_length_from_tokenizer(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    processor.tokenizer.model_max_length = 6
+    data_path = tmp_path / "long-text.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "long-text",
+                    "conversations": [
+                        {"from": "human", "value": "token_2 token_3 token_4 token_5"},
+                        {"from": "gpt", "value": "token_6 token_7 token_8 token_9 token_10 token_11"},
+                    ],
+                }
+            ]
+        )
+    )
+
+    dataset = LlavaPretrainDataset(data_path=data_path, image_folder=tmp_path, processor=processor)
+    sample = dataset[0]
+
+    assert dataset.model_max_length == 6
+    assert sample["input_ids"].shape[0] == 6
+
+
 def test_pretrain_collator_supports_mixed_text_and_image_records(
     tmp_path: Path,
     tiny_model_yaml_path: Path,
@@ -417,6 +483,7 @@ def test_pretraining_from_yaml_runs_projector_only_tiny_training(
                 "training": {
                     "output_dir": str(output_dir),
                     "trainable_modules": "projector",
+                    "model_max_length": 32,
                     "max_steps": 1,
                     "per_device_train_batch_size": 1,
                     "learning_rate": 1.0e-3,
