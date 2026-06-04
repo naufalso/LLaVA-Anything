@@ -88,6 +88,85 @@ def test_pretrain_collator_pads_text_and_stacks_images(
     assert batch["pixel_values"].shape == (2, 3, 8, 8)
 
 
+def test_pretrain_dataset_supports_text_only_records(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    data_path = tmp_path / "text-only.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "text-only",
+                    "conversations": [
+                        {"from": "human", "value": "What is the capital of France?"},
+                        {"from": "gpt", "value": "Paris"},
+                    ],
+                }
+            ]
+        )
+    )
+
+    dataset = LlavaPretrainDataset(data_path=data_path, image_folder=tmp_path, processor=processor)
+    sample = dataset[0]
+
+    assert sample["input_ids"].shape == sample["labels"].shape
+    assert "pixel_values" not in sample
+    assert "image_sizes" not in sample
+    assert int((sample["labels"] != IGNORE_INDEX).sum().item()) > 0
+
+
+def test_pretrain_collator_supports_mixed_text_and_image_records(
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+    tiny_image,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    image_path = tmp_path / "image.jpg"
+    tiny_image.save(image_path)
+    data_path = tmp_path / "mixed.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "text-only",
+                    "conversations": [
+                        {"from": "human", "value": "Say hello."},
+                        {"from": "gpt", "value": "hello"},
+                    ],
+                },
+                {
+                    "id": "image",
+                    "image": image_path.name,
+                    "conversations": [
+                        {"from": "human", "value": "<image>\nWhat is shown?"},
+                        {"from": "gpt", "value": "available"},
+                    ],
+                },
+            ]
+        )
+    )
+    dataset = LlavaPretrainDataset(data_path=data_path, image_folder=tmp_path, processor=processor)
+    collator = LlavaPretrainDataCollator(processor.tokenizer)
+
+    batch = collator([dataset[0], dataset[1]])
+
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["labels"].shape == batch["input_ids"].shape
+    assert batch["pixel_values"].shape == (1, 3, 8, 8)
+
+    from transformers import AutoModelForImageTextToText
+
+    model = AutoModelForImageTextToText.from_pretrained(tiny_full_model_dir)
+    output = model(**batch)
+    assert output.loss >= 0
+
+
 
 def test_pretrain_dataset_collates_anyres_images_with_image_sizes(
     tmp_path: Path,
@@ -162,7 +241,7 @@ def test_pretrain_dataset_collates_anyres_images_with_image_sizes(
     assert (batch["input_ids"] == image_token_id).sum(dim=1).tolist() == [10, 14]
 
 
-def test_pretrain_dataset_can_filter_records_to_available_images(
+def test_pretrain_dataset_can_filter_records_to_text_only_and_available_images(
     tmp_path: Path,
     tiny_model_yaml_path: Path,
     tiny_full_model_dir: Path,
@@ -203,7 +282,7 @@ def test_pretrain_dataset_can_filter_records_to_available_images(
         )
     )
 
-    with pytest.warns(UserWarning, match="2 images not found and skipping those"):
+    with pytest.warns(UserWarning, match="1 image not found and skipping those"):
         dataset = LlavaPretrainDataset(
             data_path=data_path,
             image_folder=tmp_path,
@@ -211,9 +290,10 @@ def test_pretrain_dataset_can_filter_records_to_available_images(
             available_images_only=True,
         )
 
-    assert len(dataset) == 1
-    assert dataset.records[0]["id"] == "available"
-    assert dataset[0]["pixel_values"].shape == (3, 8, 8)
+    assert len(dataset) == 2
+    assert [record["id"] for record in dataset.records] == ["text-only", "available"]
+    assert "pixel_values" not in dataset[0]
+    assert dataset[1]["pixel_values"].shape == (3, 8, 8)
 
 
 def test_pretrain_dataset_warns_and_skips_missing_images_by_default(

@@ -21,17 +21,39 @@ from .builder import config_from_yaml_dict, load_yaml, model_from_yaml_dict, pro
 from .modeling_llava_anything import LlavaAnythingForConditionalGeneration
 from .processing_llava_anything import LlavaAnythingProcessor
 
+import torch.distributed as dist
+from tqdm import tqdm
+
 IGNORE_INDEX = -100
 
+def _is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 def _load_json_records(path: str | Path) -> list[dict[str, Any]]:
     """Load JSON or JSONL training records from disk."""
 
     path = Path(path)
     if path.suffix == ".jsonl":
-        with path.open("r", encoding="utf-8") as handle:
-            records = [json.loads(line) for line in handle if line.strip()]
+        print(f"Loading JSONL records from {path}")
+        with path.open("r", encoding="utf-8") as f:
+            records = []
+            iterator = tqdm(
+                f,
+                desc=f"Loading {path}",
+                unit=" records",
+                disable=not _is_main_process(),
+                mininterval=10.0 # Update the progress bar at most every 10 seconds to reduce overhead on large logs
+            )
+            for line_no, line in enumerate(iterator, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
     else:
+        print(f"Loading JSON records from {path}")
         with path.open("r", encoding="utf-8") as handle:
             records = json.load(handle)
     if not isinstance(records, list):
@@ -134,7 +156,7 @@ class LlavaPretrainDataset(Dataset):
         available_images_only: bool = True,
         system_prompt: str | None = None,
     ) -> None:
-        """Load record metadata and optionally filter examples missing image files."""
+        """Load record metadata and optionally filter examples with missing image files."""
 
         self.data_path = Path(data_path)
         self.image_folder = Path(image_folder)
@@ -169,6 +191,11 @@ class LlavaPretrainDataset(Dataset):
             raise ValueError("Pretraining records must include an image path.")
         return self.image_folder / str(image_name)
 
+    def _record_has_image(self, record: dict[str, Any]) -> bool:
+        """Return whether a record declares an image input."""
+
+        return bool(record.get("image"))
+
     def _record_has_available_image(self, record: dict[str, Any]) -> bool:
         """Return whether a record points to an existing image file."""
 
@@ -181,12 +208,14 @@ class LlavaPretrainDataset(Dataset):
         self,
         records: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
-        """Keep records with existing images and count skipped examples."""
+        """Keep text-only records and image records with existing files."""
 
         available: list[dict[str, Any]] = []
         skipped_count = 0
-        for record in records:
-            if self._record_has_available_image(record):
+        for record in tqdm(records, disable=not _is_main_process(), mininterval=10.0, desc="Checking for available images"):
+            if not self._record_has_image(record):
+                available.append(record)
+            elif self._record_has_available_image(record):
                 available.append(record)
             else:
                 skipped_count += 1
@@ -199,15 +228,20 @@ class LlavaPretrainDataset(Dataset):
         return Image.open(image_path).convert("RGB")
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Build one supervised multimodal training sample."""
+        """Build one supervised training sample, with images when present."""
 
         record = self.records[index]
         prefix, assistant_text = _preview_record(self.processor, record, self.system_prompt)
         eos = self.processor.tokenizer.eos_token or ""
         full_text = f"{prefix}{assistant_text}{eos}"
 
-        image = self._load_image(record)
-        if getattr(self.processor, "image_mode", "fixed") == "anyres":
+        has_image = self._record_has_image(record)
+        image_token = self.processor.image_token
+        if not has_image and image_token in full_text:
+            raise ValueError("Text-only records must not contain the image token.")
+
+        if has_image and getattr(self.processor, "image_mode", "fixed") == "anyres":
+            image = self._load_image(record)
             full_inputs = self.processor(images=image, text=full_text, return_tensors="pt", add_special_tokens=False)
             prefix_inputs = self.processor(images=image, text=prefix, return_tensors="pt", add_special_tokens=False)
             input_ids = full_inputs["input_ids"][0]
@@ -216,17 +250,18 @@ class LlavaPretrainDataset(Dataset):
         else:
             input_ids = _tokenize_text(self.processor, full_text)
             prefix_ids = _tokenize_text(self.processor, prefix)
-            image_inputs = self.processor(images=image, return_tensors="pt")
+            image_inputs = self.processor(images=self._load_image(record), return_tensors="pt") if has_image else {}
 
         labels = input_ids.clone()
         labels[: prefix_ids.shape[0]] = IGNORE_INDEX
-        labels[input_ids == self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)] = IGNORE_INDEX
+        labels[input_ids == self.processor.tokenizer.convert_tokens_to_ids(image_token)] = IGNORE_INDEX
 
         sample = {
             "input_ids": input_ids,
             "labels": labels,
-            "pixel_values": image_inputs["pixel_values"][0],
         }
+        if image_inputs:
+            sample["pixel_values"] = image_inputs["pixel_values"][0]
         if "image_sizes" in image_inputs:
             sample["image_sizes"] = image_inputs["image_sizes"][0]
         return sample
@@ -246,7 +281,7 @@ class LlavaPretrainDataCollator:
         return pad_sequence(tensors, batch_first=True, padding_value=padding_value)
 
     def __call__(self, instances: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        """Collate token, label, image, and optional image-size tensors into a batch."""
+        """Collate text plus any available image tensors into a batch."""
 
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
@@ -255,31 +290,33 @@ class LlavaPretrainDataCollator:
         input_ids = self._pad_sequence([instance["input_ids"] for instance in instances], pad_token_id)
         labels = self._pad_sequence([instance["labels"] for instance in instances], IGNORE_INDEX)
         attention_mask = input_ids.ne(pad_token_id)
-        pixel_value_tensors = [instance["pixel_values"] for instance in instances]
-        if pixel_value_tensors[0].dim() == 4:
-            max_patches = max(tensor.shape[0] for tensor in pixel_value_tensors)
-            padded_pixel_values = []
-            for tensor in pixel_value_tensors:
-                if tensor.shape[0] < max_patches:
-                    padding = torch.zeros(
-                        (max_patches - tensor.shape[0], *tensor.shape[1:]),
-                        dtype=tensor.dtype,
-                        device=tensor.device,
-                    )
-                    tensor = torch.cat([tensor, padding], dim=0)
-                padded_pixel_values.append(tensor)
-            pixel_values = torch.stack(padded_pixel_values)
-        else:
-            pixel_values = torch.stack(pixel_value_tensors)
-
         batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
-            "pixel_values": pixel_values,
         }
-        if "image_sizes" in instances[0]:
-            batch["image_sizes"] = torch.stack([instance["image_sizes"] for instance in instances])
+        image_instances = [instance for instance in instances if "pixel_values" in instance]
+        if image_instances:
+            pixel_value_tensors = [instance["pixel_values"] for instance in image_instances]
+            if pixel_value_tensors[0].dim() == 4:
+                max_patches = max(tensor.shape[0] for tensor in pixel_value_tensors)
+                padded_pixel_values = []
+                for tensor in pixel_value_tensors:
+                    if tensor.shape[0] < max_patches:
+                        padding = torch.zeros(
+                            (max_patches - tensor.shape[0], *tensor.shape[1:]),
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        )
+                        tensor = torch.cat([tensor, padding], dim=0)
+                    padded_pixel_values.append(tensor)
+                batch["pixel_values"] = torch.stack(padded_pixel_values)
+            else:
+                batch["pixel_values"] = torch.stack(pixel_value_tensors)
+
+        image_size_tensors = [instance["image_sizes"] for instance in image_instances if "image_sizes" in instance]
+        if image_size_tensors:
+            batch["image_sizes"] = torch.stack(image_size_tensors)
         return batch
 
 
