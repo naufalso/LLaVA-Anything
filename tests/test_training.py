@@ -20,6 +20,7 @@ from llava_anything.training import (
     log_preview_samples,
     run_pretraining_from_yaml,
     _coerce_training_arguments,
+    _resolve_resume_from_checkpoint,
 )
 
 
@@ -600,6 +601,36 @@ def test_training_arguments_coerces_yaml_boolean_no_save_strategy(tmp_path: Path
     )
 
     assert args.save_strategy == "no"
+
+
+def test_training_defaults_to_latest_checkpoint_in_output_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    (output_dir / "checkpoint-10").mkdir(parents=True)
+    (output_dir / "checkpoint-2").mkdir()
+    args = _coerce_training_arguments(
+        {
+            "output_dir": str(output_dir),
+            "save_strategy": "no",
+            "report_to": [],
+        }
+    )
+
+    assert _resolve_resume_from_checkpoint(args) == str(output_dir / "checkpoint-10")
+
+
+def test_training_resume_from_checkpoint_can_be_disabled(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    (output_dir / "checkpoint-10").mkdir(parents=True)
+    args = _coerce_training_arguments(
+        {
+            "output_dir": str(output_dir),
+            "resume_from_checkpoint": False,
+            "save_strategy": "no",
+            "report_to": [],
+        }
+    )
+
+    assert _resolve_resume_from_checkpoint(args) is False
 
 
 def test_configure_wandb_missing_section_is_noop(monkeypatch) -> None:

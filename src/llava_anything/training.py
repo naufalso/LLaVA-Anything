@@ -16,6 +16,7 @@ from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from transformers import Trainer, TrainingArguments
+from transformers.trainer_utils import get_last_checkpoint
 
 from .builder import config_from_yaml_dict, load_yaml, model_from_yaml_dict, processor_from_yaml_dict
 from .modeling_llava_anything import LlavaAnythingForConditionalGeneration
@@ -439,6 +440,19 @@ def _coerce_training_arguments(training_section: dict[str, Any]) -> TrainingArgu
     return TrainingArguments(**kwargs)
 
 
+def _resolve_resume_from_checkpoint(training_args: TrainingArguments) -> str | bool | None:
+    """Resolve the checkpoint to resume from, auto-detecting the latest checkpoint by default."""
+
+    explicit_resume = getattr(training_args, "resume_from_checkpoint", None)
+    if explicit_resume is not None:
+        return explicit_resume
+
+    output_dir = Path(training_args.output_dir)
+    if not output_dir.is_dir():
+        return None
+    return get_last_checkpoint(str(output_dir))
+
+
 def _load_training_yaml(path: str | Path) -> dict[str, Any]:
     """Load a training YAML file and require a top-level mapping."""
 
@@ -584,7 +598,10 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         train_dataset=dataset,
         data_collator=collator,
     )
-    train_result = trainer.train()
+    resume_from_checkpoint = _resolve_resume_from_checkpoint(training_args)
+    if resume_from_checkpoint and _is_main_process():
+        print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     output_dir = Path(training_args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
