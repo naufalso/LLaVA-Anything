@@ -27,8 +27,26 @@ from tqdm import tqdm
 
 IGNORE_INDEX = -100
 
+
+def _process_rank() -> int:
+    """Return the current distributed rank from torch or launcher environment."""
+
+    if dist.is_initialized():
+        return dist.get_rank()
+    for env_name in ("RANK", "SLURM_PROCID"):
+        env_value = os.environ.get(env_name)
+        if env_value is None:
+            continue
+        try:
+            return int(env_value)
+        except ValueError:
+            continue
+    return 0
+
+
 def _is_main_process():
-    return not dist.is_initialized() or dist.get_rank() == 0
+    return _process_rank() == 0
+
 
 def _load_json_records(path: str | Path, max_samples: int | None = None) -> list[dict[str, Any]]:
     """Load JSON or JSONL training records from disk."""
@@ -188,6 +206,8 @@ class LlavaPretrainDataset(Dataset):
         processor: LlavaAnythingProcessor,
         max_samples: int | None = None,
         available_images_only: bool = True,
+        available_images_cache_dir: str | Path | None = None,
+        refresh_available_images_cache: bool = False,
         system_prompt: str | None = None,
         model_max_length: int | None = None,
     ) -> None:
@@ -200,6 +220,11 @@ class LlavaPretrainDataset(Dataset):
         if system_prompt is not None and not isinstance(system_prompt, str):
             raise TypeError("system_prompt must be a string when provided.")
         self.system_prompt = system_prompt or None
+        self.max_samples = max_samples
+        self.available_images_cache_dir = (
+            Path(available_images_cache_dir) if available_images_cache_dir else None
+        )
+        self.refresh_available_images_cache = refresh_available_images_cache
         records = _load_json_records(self.data_path, max_samples)
         if available_images_only:
             records, skipped_count = self._filter_available_records(records)
@@ -240,22 +265,149 @@ class LlavaPretrainDataset(Dataset):
             return False
         return (self.image_folder / str(image_name)).is_file()
 
+    def _available_images_cache_path(self) -> Path | None:
+        """Return the cache file used for missing image indices."""
+
+        if self.available_images_cache_dir is None:
+            return None
+        return self.available_images_cache_dir / "skipped_image_indices.json"
+
+    def _available_images_cache_metadata(self, record_count: int) -> dict[str, Any]:
+        """Build cache metadata that ties skipped indices to this dataset input."""
+
+        try:
+            data_stat = self.data_path.stat()
+            data_size = data_stat.st_size
+            data_mtime_ns = data_stat.st_mtime_ns
+        except OSError:
+            data_size = None
+            data_mtime_ns = None
+
+        return {
+            "version": 1,
+            "data_path": str(self.data_path.resolve()),
+            "data_size": data_size,
+            "data_mtime_ns": data_mtime_ns,
+            "image_folder": str(self.image_folder.resolve()),
+            "max_samples": self.max_samples,
+            "record_count": record_count,
+        }
+
+    def _load_skipped_indices_cache(self, records: list[dict[str, Any]]) -> set[int] | None:
+        """Load cached missing-image indices when the cache still matches the dataset."""
+
+        cache_path = self._available_images_cache_path()
+        if (
+            cache_path is None
+            or self.refresh_available_images_cache
+            or not cache_path.is_file()
+        ):
+            return None
+
+        try:
+            with cache_path.open("r", encoding="utf-8") as handle:
+                cache = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.warn(
+                f"Ignoring unavailable image cache at {cache_path}: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+
+        expected_metadata = self._available_images_cache_metadata(len(records))
+        if cache.get("metadata") != expected_metadata:
+            return None
+
+        skipped_indices = cache.get("skipped_indices")
+        if not isinstance(skipped_indices, list) or not all(
+            isinstance(index, int) for index in skipped_indices
+        ):
+            warnings.warn(
+                f"Ignoring malformed unavailable image cache at {cache_path}.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+
+        skipped = set(skipped_indices)
+        if any(index < 0 or index >= len(records) for index in skipped):
+            warnings.warn(
+                f"Ignoring out-of-range unavailable image cache at {cache_path}.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+
+        if _is_main_process():
+            print(
+                f"Loaded {len(skipped)} cached skipped image index/indices from {cache_path}"
+            )
+        return skipped
+
+    def _save_skipped_indices_cache(
+        self,
+        records: list[dict[str, Any]],
+        skipped_indices: list[int],
+    ) -> None:
+        """Persist missing-image indices for faster restarts on the same dataset."""
+
+        cache_path = self._available_images_cache_path()
+        if cache_path is None or not _is_main_process():
+            return
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache = {
+            "metadata": self._available_images_cache_metadata(len(records)),
+            "skipped_indices": skipped_indices,
+        }
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(cache, handle)
+            os.replace(tmp_path, cache_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+        if _is_main_process():
+            print(
+                f"Saved {len(skipped_indices)} skipped image index/indices to {cache_path}"
+            )
+
     def _filter_available_records(
         self,
         records: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
         """Keep text-only records and image records with existing files."""
 
+        cached_skipped_indices = self._load_skipped_indices_cache(records)
+        if cached_skipped_indices is not None:
+            available = [
+                record
+                for index, record in enumerate(records)
+                if index not in cached_skipped_indices
+            ]
+            return available, len(cached_skipped_indices)
+
         available: list[dict[str, Any]] = []
-        skipped_count = 0
-        for record in tqdm(records, disable=not _is_main_process(), mininterval=10.0, desc="Checking for available images"):
+        skipped_indices: list[int] = []
+        for index, record in enumerate(
+            tqdm(
+                records,
+                disable=not _is_main_process(),
+                mininterval=10.0,
+                desc="Checking for available images",
+            )
+        ):
             if not self._record_has_image(record):
                 available.append(record)
             elif self._record_has_available_image(record):
                 available.append(record)
             else:
-                skipped_count += 1
-        return available, skipped_count
+                skipped_indices.append(index)
+        self._save_skipped_indices_cache(records, skipped_indices)
+        return available, len(skipped_indices)
 
     def _load_image(self, record: dict[str, Any]) -> Image.Image:
         """Load a record image as RGB PIL data."""
@@ -535,7 +687,7 @@ def _load_checkpoint_model_and_processor(
     return model, processor
 
 
-def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
+def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     """Run the full pretraining loop described by a YAML configuration."""
 
     data = _load_training_yaml(path)
@@ -549,6 +701,8 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     training_section = data.get("training", {})
     if not isinstance(training_section, dict):
         raise ValueError("training must be a mapping.")
+    if "output_dir" not in training_section:
+        raise ValueError("training.output_dir is required.")
     logging_section = data.get("logging", {}) or {}
     if not isinstance(logging_section, dict):
         raise ValueError("logging must be a mapping when provided.")
@@ -579,6 +733,11 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     training_args_data.pop("trainable_modules", None)
     model_max_length = training_args_data.pop("model_max_length", None)
     trainable_names = apply_trainable_modules(model, trainable_modules)
+    available_images_cache_dir = data_section.get("available_images_cache_dir")
+    if available_images_cache_dir is None and bool(
+        data_section.get("available_images_cache", True)
+    ):
+        available_images_cache_dir = training_section["output_dir"]
 
     dataset = LlavaPretrainDataset(
         data_path=data_section["data_path"],
@@ -586,6 +745,10 @@ def run_pretraining_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         processor=processor,
         max_samples=data_section.get("max_samples"),
         available_images_only=bool(data_section.get("available_images_only", True)),
+        available_images_cache_dir=available_images_cache_dir,
+        refresh_available_images_cache=bool(
+            data_section.get("refresh_available_images_cache", False)
+        ),
         system_prompt=data_section.get("system_prompt"),
         model_max_length=model_max_length,
     )
@@ -620,7 +783,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run LLaVa-Anything training from a YAML config.")
     parser.add_argument("training_yaml", type=Path)
     args = parser.parse_args()
-    result = run_pretraining_from_yaml(args.training_yaml)
+    result = run_training_from_yaml(args.training_yaml)
     print(f"training_loss: {result.train_result.training_loss}")
     print(f"output_dir: {result.output_dir}")
     print(f"trainable_parameters: {len(result.trainable_parameter_names)}")
@@ -634,7 +797,7 @@ __all__ = [
     "apply_trainable_modules",
     "configure_wandb",
     "log_preview_samples",
-    "run_pretraining_from_yaml",
+    "run_training_from_yaml",
 ]
 
 
