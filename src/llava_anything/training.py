@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +48,20 @@ def _process_rank() -> int:
 
 def _is_main_process():
     return _process_rank() == 0
+
+
+def _launcher_world_size() -> int:
+    """Return the process count from torchrun/launcher environment when available."""
+
+    for env_name in ("WORLD_SIZE", "SLURM_NTASKS"):
+        env_value = os.environ.get(env_name)
+        if env_value is None:
+            continue
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            continue
+    return 1
 
 
 def _load_json_records(path: str | Path, max_samples: int | None = None) -> list[dict[str, Any]]:
@@ -207,6 +223,7 @@ class LlavaPretrainDataset(Dataset):
         max_samples: int | None = None,
         available_images_only: bool = True,
         available_images_cache_dir: str | Path | None = None,
+        available_images_num_workers: int = 0,
         refresh_available_images_cache: bool = False,
         system_prompt: str | None = None,
         model_max_length: int | None = None,
@@ -224,6 +241,7 @@ class LlavaPretrainDataset(Dataset):
         self.available_images_cache_dir = (
             Path(available_images_cache_dir) if available_images_cache_dir else None
         )
+        self.available_images_num_workers = max(0, int(available_images_num_workers))
         self.refresh_available_images_cache = refresh_available_images_cache
         records = _load_json_records(self.data_path, max_samples)
         if available_images_only:
@@ -264,6 +282,13 @@ class LlavaPretrainDataset(Dataset):
         if not image_name:
             return False
         return (self.image_folder / str(image_name)).is_file()
+
+    def _record_is_available(self, record: dict[str, Any]) -> bool:
+        """Return whether a record should be kept after image availability filtering."""
+
+        if not self._record_has_image(record):
+            return True
+        return self._record_has_available_image(record)
 
     def _available_images_cache_path(self) -> Path | None:
         """Return the cache file used for missing image indices."""
@@ -345,6 +370,24 @@ class LlavaPretrainDataset(Dataset):
             )
         return skipped
 
+    def _wait_for_skipped_indices_cache(
+        self,
+        records: list[dict[str, Any]],
+        poll_seconds: float = 10.0,
+    ) -> set[int]:
+        """Wait for rank 0 to write a valid skipped-index cache."""
+
+        cache_path = self._available_images_cache_path()
+        if cache_path is None:
+            raise RuntimeError("Cannot wait for skipped image cache without a cache path.")
+
+        while True:
+            if cache_path.is_file():
+                cached_skipped_indices = self._load_skipped_indices_cache(records)
+                if cached_skipped_indices is not None:
+                    return cached_skipped_indices
+            time.sleep(poll_seconds)
+
     def _save_skipped_indices_cache(
         self,
         records: list[dict[str, Any]],
@@ -390,22 +433,56 @@ class LlavaPretrainDataset(Dataset):
             ]
             return available, len(cached_skipped_indices)
 
+        if (
+            not _is_main_process()
+            and _launcher_world_size() > 1
+            and self._available_images_cache_path() is not None
+            and not self.refresh_available_images_cache
+        ):
+            cached_skipped_indices = self._wait_for_skipped_indices_cache(records)
+            available = [
+                record
+                for index, record in enumerate(records)
+                if index not in cached_skipped_indices
+            ]
+            return available, len(cached_skipped_indices)
+
         available: list[dict[str, Any]] = []
         skipped_indices: list[int] = []
-        for index, record in enumerate(
-            tqdm(
-                records,
-                disable=not _is_main_process(),
-                mininterval=10.0,
-                desc="Checking for available images",
+        worker_count = self.available_images_num_workers
+        if worker_count > 1 and _is_main_process():
+            print(f"Checking image availability with {worker_count} workers")
+
+        def collect(is_available_by_index) -> None:
+            for index, (record, is_available) in enumerate(
+                zip(records, is_available_by_index)
+            ):
+                if is_available:
+                    available.append(record)
+                else:
+                    skipped_indices.append(index)
+
+        if worker_count <= 1:
+            is_available_iter = (
+                self._record_is_available(record)
+                for record in tqdm(
+                    records,
+                    disable=not _is_main_process(),
+                    mininterval=10.0,
+                    desc="Checking for available images",
+                )
             )
-        ):
-            if not self._record_has_image(record):
-                available.append(record)
-            elif self._record_has_available_image(record):
-                available.append(record)
-            else:
-                skipped_indices.append(index)
+            collect(is_available_iter)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                is_available_iter = tqdm(
+                    executor.map(self._record_is_available, records),
+                    total=len(records),
+                    disable=not _is_main_process(),
+                    mininterval=10.0,
+                    desc="Checking for available images",
+                )
+                collect(is_available_iter)
         self._save_skipped_indices_cache(records, skipped_indices)
         return available, len(skipped_indices)
 
@@ -733,6 +810,7 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     training_args_data.pop("trainable_modules", None)
     model_max_length = training_args_data.pop("model_max_length", None)
     trainable_names = apply_trainable_modules(model, trainable_modules)
+    dataloader_num_workers = int(training_section.get("dataloader_num_workers") or 0)
     available_images_cache_dir = data_section.get("available_images_cache_dir")
     if available_images_cache_dir is None and bool(
         data_section.get("available_images_cache", True)
@@ -746,6 +824,7 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         max_samples=data_section.get("max_samples"),
         available_images_only=bool(data_section.get("available_images_only", True)),
         available_images_cache_dir=available_images_cache_dir,
+        available_images_num_workers=dataloader_num_workers,
         refresh_available_images_cache=bool(
             data_section.get("refresh_available_images_cache", False)
         ),
