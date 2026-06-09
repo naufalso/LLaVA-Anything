@@ -1,0 +1,52 @@
+model_checkpoint: checkpoints/apertus-8b-siglip2-anyres-pretrain-projector-256batch
+model_kwargs:
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+data:
+  data_path: data/PangeaInstruct/PangeaIns-Corrected.jsonl
+  image_folder: data/PangeaInstruct
+  available_images_cache_dir: checkpoints/apertus-8b-siglip2-anyres-pangea-full
+  require_image: true
+  min_image_width: 16
+  min_image_height: 16
+  max_image_aspect_ratio: 8.0
+  max_image_tokens: 3699
+  image_constraint_prefilter: false
+  image_token_mismatch_prefilter: false
+  system_prompt: "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
+
+logging:
+  preview_samples: 2
+
+training:
+  output_dir: checkpoints/apertus-8b-siglip2-anyres-pangea-full-restart200
+  resume_from_checkpoint: true
+  deepspeed: configs/deepspeed/zero3_offload.json
+  trainable_modules: full
+  frozen_parameter_patterns:
+    - "language_model.*.mlp.act_fn.alpha_p"
+    - "language_model.*.mlp.act_fn.alpha_n"
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  model_max_length: 4096
+  num_train_epochs: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  bf16: true
+  logging_steps: 1
+  logging_nan_inf_filter: false
+  skip_nonfinite_loss: true
+  skip_nonfinite_gradients: true
+  max_consecutive_nonfinite_losses: 8
+  finite_parameter_check_steps: 80
+  save_strategy: steps
+  save_steps: 200
+  save_total_limit: 1
+  remove_unused_columns: false
+  dataloader_num_workers: 4
+  report_to: ["wandb"]

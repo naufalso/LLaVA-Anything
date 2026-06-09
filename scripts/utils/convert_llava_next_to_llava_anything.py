@@ -19,6 +19,12 @@ from llava_anything.modeling_llava_anything import LlavaAnythingForConditionalGe
 DEFAULT_TEXT_MODEL = "swiss-ai/Apertus-8B-Instruct-2509"
 DEFAULT_IMAGE_TOKEN_ID = 999
 
+TEXT_ARCHITECTURES_BY_MODEL_TYPE = {
+    "apertus": "ApertusForCausalLM",
+    "llama": "LlamaForCausalLM",
+    "qwen2": "Qwen2ForCausalLM",
+}
+
 
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
@@ -154,10 +160,96 @@ def infer_vision_model_type(llava_next_config: dict[str, Any], fallback: str | N
     return "clip_vision_model"
 
 
+def infer_text_model_name_or_path(llava_next_config: dict[str, Any], fallback: str | None) -> str:
+    if fallback:
+        return fallback
+    name_or_path = llava_next_config.get("_name_or_path")
+    if isinstance(name_or_path, str) and name_or_path:
+        return name_or_path
+    return DEFAULT_TEXT_MODEL
+
+
+def infer_text_architectures(llava_next_config: dict[str, Any]) -> list[str] | None:
+    model_type = str(llava_next_config.get("model_type", "apertus"))
+    architecture = TEXT_ARCHITECTURES_BY_MODEL_TYPE.get(model_type)
+    if architecture:
+        return [architecture]
+    source_architectures = llava_next_config.get("architectures")
+    if isinstance(source_architectures, list):
+        architectures = [str(item) for item in source_architectures if "llava" not in str(item).lower()]
+        if architectures:
+            return architectures
+    return None
+
+
+def image_token_id_from_tokenizer_json(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    tokenizer = load_json(path)
+    vocab = tokenizer.get("model", {}).get("vocab", {})
+    if isinstance(vocab, dict):
+        token_id = vocab.get("<image>")
+        if token_id is not None:
+            return int(token_id)
+    for item in tokenizer.get("added_tokens", []) or []:
+        if isinstance(item, dict) and item.get("content") == "<image>":
+            return int(item["id"])
+    return None
+
+
+def image_token_id_from_tokenizer_config(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    config = load_json(path)
+    decoder = config.get("added_tokens_decoder", {})
+    if isinstance(decoder, dict):
+        for token_id, item in decoder.items():
+            if isinstance(item, dict) and item.get("content") == "<image>":
+                return int(token_id)
+    return None
+
+
+def next_free_token_id(source_dir: Path) -> int | None:
+    used_ids: set[int] = set()
+    tokenizer_json = source_dir / "tokenizer.json"
+    if tokenizer_json.exists():
+        tokenizer = load_json(tokenizer_json)
+        vocab = tokenizer.get("model", {}).get("vocab", {})
+        if isinstance(vocab, dict):
+            used_ids.update(int(token_id) for token_id in vocab.values())
+        for item in tokenizer.get("added_tokens", []) or []:
+            if isinstance(item, dict) and "id" in item:
+                used_ids.add(int(item["id"]))
+    tokenizer_config = source_dir / "tokenizer_config.json"
+    if tokenizer_config.exists():
+        config = load_json(tokenizer_config)
+        decoder = config.get("added_tokens_decoder", {})
+        if isinstance(decoder, dict):
+            used_ids.update(int(token_id) for token_id in decoder)
+    return max(used_ids) + 1 if used_ids else None
+
+
+def resolve_image_token_id(source_dir: Path, llava_next_config: dict[str, Any], requested_image_token_id: int | None) -> int:
+    if requested_image_token_id is not None:
+        return int(requested_image_token_id)
+    for candidate in (
+        image_token_id_from_tokenizer_json(source_dir / "tokenizer.json"),
+        image_token_id_from_tokenizer_config(source_dir / "tokenizer_config.json"),
+        llava_next_config.get("image_token_index"),
+    ):
+        if candidate is not None:
+            return int(candidate)
+    candidate = next_free_token_id(source_dir)
+    vocab_size = int(llava_next_config["vocab_size"])
+    if candidate is not None and candidate < vocab_size:
+        return int(candidate)
+    return DEFAULT_IMAGE_TOKEN_ID
+
+
 def build_llava_anything_config(
     llava_next_config: dict[str, Any],
     source_dir: Path,
-    text_model_name_or_path: str,
+    text_model_name_or_path: str | None,
     vision_model_name_or_path: str | None,
     vision_model_type: str | None,
     vision_image_size: int | None,
@@ -187,18 +279,24 @@ def build_llava_anything_config(
         "rms_norm_eps",
         "rope_scaling",
         "rope_theta",
+        "sliding_window",
         "tie_word_embeddings",
+        "torch_dtype",
         "use_cache",
+        "use_sliding_window",
     ]
+    resolved_text_model_name_or_path = infer_text_model_name_or_path(llava_next_config, text_model_name_or_path)
     text_config = {key: llava_next_config[key] for key in text_keys if key in llava_next_config}
+    architectures = infer_text_architectures(llava_next_config)
     text_config.update(
         {
-            "_name_or_path": text_model_name_or_path,
-            "architectures": ["ApertusForCausalLM"],
-            "model_type": "apertus",
+            "_name_or_path": resolved_text_model_name_or_path,
+            "model_type": llava_next_config.get("model_type", "apertus"),
             "vocab_size": int(llava_next_config["vocab_size"]),
         }
     )
+    if architectures is not None:
+        text_config["architectures"] = architectures
 
     inferred_patch_size = infer_vision_patch_size(source_dir, vision_patch_size or 14)
     inferred_image_size = infer_vision_image_size(source_dir, inferred_patch_size, vision_image_size or 336)
@@ -239,12 +337,12 @@ def build_llava_anything_config(
         num_additional_image_tokens=num_additional_image_tokens,
         image_mode="anyres" if llava_next_config.get("image_aspect_ratio") == "anyres" else "fixed",
         image_grid_pinpoints=llava_next_config.get("image_grid_pinpoints"),
-        text_model_name_or_path=text_model_name_or_path,
+        text_model_name_or_path=resolved_text_model_name_or_path,
         vision_model_name_or_path=vision_model_name_or_path or llava_next_config.get("mm_vision_tower"),
         trust_remote_code=False,
         text_trust_remote_code=False,
         vision_trust_remote_code=False,
-        dtype=llava_next_config.get("dtype"),
+        dtype=llava_next_config.get("dtype", llava_next_config.get("torch_dtype")),
         hidden_size=llava_next_config.get("hidden_size"),
         vocab_size=int(llava_next_config["vocab_size"]),
         use_cache=llava_next_config.get("use_cache", True),
@@ -260,21 +358,25 @@ def build_processor_config(
     vision_patch_size: int,
     vision_feature_select_strategy: str,
     num_additional_image_tokens: int,
+    vision_model_type: str,
 ) -> dict[str, Any]:
+    is_clip = vision_model_type == "clip_vision_model"
     return {
         "image_grid_pinpoints": llava_next_config.get("image_grid_pinpoints"),
         "image_mode": "anyres" if llava_next_config.get("image_aspect_ratio") == "anyres" else "fixed",
         "image_processor": {
-            "do_convert_rgb": None,
+            "crop_size": {"height": int(vision_image_size), "width": int(vision_image_size)} if is_clip else None,
+            "do_center_crop": True if is_clip else None,
+            "do_convert_rgb": True if is_clip else None,
             "do_normalize": True,
             "do_rescale": True,
             "do_resize": True,
-            "image_mean": [0.5, 0.5, 0.5],
-            "image_processor_type": "SiglipImageProcessor",
-            "image_std": [0.5, 0.5, 0.5],
-            "resample": 2,
+            "image_mean": [0.48145466, 0.4578275, 0.40821073] if is_clip else [0.5, 0.5, 0.5],
+            "image_processor_type": "CLIPImageProcessor" if is_clip else "SiglipImageProcessor",
+            "image_std": [0.26862954, 0.26130258, 0.27577711] if is_clip else [0.5, 0.5, 0.5],
+            "resample": 3 if is_clip else 2,
             "rescale_factor": 1 / 255,
-            "size": {"height": int(vision_image_size), "width": int(vision_image_size)},
+            "size": {"shortest_edge": int(vision_image_size)} if is_clip else {"height": int(vision_image_size), "width": int(vision_image_size)},
         },
         "image_seq_length": (int(vision_image_size) // int(vision_patch_size)) ** 2,
         "image_token": "<image>",
@@ -285,21 +387,28 @@ def build_processor_config(
     }
 
 
-def rewrite_tokenizer_json(path: Path, image_token_id: int) -> None:
+def tokenizer_uses_added_tokens_for_specials(tokenizer_class: str | None) -> bool:
+    return bool(tokenizer_class and tokenizer_class.lower().startswith("qwen"))
+
+
+def rewrite_tokenizer_json(path: Path, image_token_id: int, tokenizer_class: str | None = None) -> None:
     tokenizer = load_json(path)
     vocab = tokenizer.get("model", {}).get("vocab")
     if not isinstance(vocab, dict):
         raise ValueError(f"Expected tokenizer model vocab mapping in {path}")
 
     image_token_id = int(image_token_id)
-    for token, token_id in list(vocab.items()):
-        if int(token_id) == image_token_id:
-            del vocab[token]
-            break
+    keep_image_as_added_token = tokenizer_uses_added_tokens_for_specials(tokenizer_class)
+    if not keep_image_as_added_token:
+        for token, token_id in list(vocab.items()):
+            if int(token_id) == image_token_id:
+                del vocab[token]
+                break
     stale_image_id = vocab.get("<image>")
-    if stale_image_id is not None and int(stale_image_id) != image_token_id:
+    if stale_image_id is not None and (keep_image_as_added_token or int(stale_image_id) != image_token_id):
         del vocab["<image>"]
-    vocab["<image>"] = image_token_id
+    if not keep_image_as_added_token:
+        vocab["<image>"] = image_token_id
 
     added_tokens = tokenizer.setdefault("added_tokens", [])
     added_tokens = [
@@ -376,6 +485,7 @@ def write_metadata(
     args: argparse.Namespace,
 ) -> LlavaAnythingConfig:
     llava_next_config = load_json(llava_next_config_path)
+    image_token_id = resolve_image_token_id(source_dir, llava_next_config, args.image_token_id)
     config = build_llava_anything_config(
         llava_next_config=llava_next_config,
         source_dir=source_dir,
@@ -385,7 +495,7 @@ def write_metadata(
         vision_image_size=args.vision_image_size,
         vision_patch_size=args.vision_patch_size,
         vision_intermediate_size=args.vision_intermediate_size,
-        image_token_id=args.image_token_id,
+        image_token_id=image_token_id,
     )
     config.save_pretrained(output_dir)
     write_json(
@@ -396,6 +506,7 @@ def write_metadata(
             config.vision_config.patch_size,
             config.vision_feature_select_strategy,
             config.num_additional_image_tokens,
+            config.vision_config.model_type,
         ),
     )
 
@@ -405,9 +516,10 @@ def write_metadata(
     copy_if_exists(source_dir, output_dir, "chat_template.jinja")
     copy_if_exists(source_dir, output_dir, "generation_config.json")
 
-    rewrite_tokenizer_json(output_dir / "tokenizer.json", args.image_token_id)
-    rewrite_tokenizer_config(output_dir / "tokenizer_config.json", args.image_token_id, llava_next_config)
-    rewrite_special_tokens_map(output_dir / "special_tokens_map.json", args.image_token_id)
+    tokenizer_config = load_json(output_dir / "tokenizer_config.json")
+    rewrite_tokenizer_json(output_dir / "tokenizer.json", image_token_id, tokenizer_config.get("tokenizer_class"))
+    rewrite_tokenizer_config(output_dir / "tokenizer_config.json", image_token_id, llava_next_config)
+    rewrite_special_tokens_map(output_dir / "special_tokens_map.json", image_token_id)
     return config
 
 
@@ -450,13 +562,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Original LLaVA-NeXT config.json. Defaults to config.json.llava-next.bak when present.",
     )
-    parser.add_argument("--text-model-name-or-path", default=DEFAULT_TEXT_MODEL)
+    parser.add_argument("--text-model-name-or-path")
     parser.add_argument("--vision-model-name-or-path")
     parser.add_argument("--vision-model-type", help="Defaults to clip_vision_model or siglip_vision_model inferred from mm_vision_tower.")
     parser.add_argument("--vision-image-size", type=int, help="Defaults to the size inferred from position embeddings.")
     parser.add_argument("--vision-patch-size", type=int, help="Defaults to the size inferred from patch embedding weights.")
     parser.add_argument("--vision-intermediate-size", type=int, help="Defaults to the size inferred from the vision MLP weights.")
-    parser.add_argument("--image-token-id", type=int, default=DEFAULT_IMAGE_TOKEN_ID)
+    parser.add_argument("--image-token-id", type=int, help="Defaults to an existing <image> token or the next free tokenizer id.")
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--device-map", default=None)
     parser.add_argument("--max-shard-size", default="5GB")

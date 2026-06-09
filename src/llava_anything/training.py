@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-import json
+from collections import deque
+import faulthandler
+from fnmatch import fnmatch
 import os
+import sys
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -14,583 +17,822 @@ from typing import Any
 
 import torch
 import yaml
-from PIL import Image
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
 from .builder import config_from_yaml_dict, load_yaml, model_from_yaml_dict, processor_from_yaml_dict
 from .modeling_llava_anything import LlavaAnythingForConditionalGeneration
 from .processing_llava_anything import LlavaAnythingProcessor
+from .dataset import (
+    IGNORE_INDEX,
+    LlavaPretrainDataCollator,
+    LlavaPretrainDataset,
+    _conversation_text,
+    _is_main_process,
+    _launcher_world_size,
+    _load_json_records,
+    _preview_record,
+    _process_rank,
+    _render_prefix,
+    _resolve_model_max_length,
+    _role_name,
+    _tokenize_text,
+    log_preview_samples,
+)
 
 import torch.distributed as dist
-from tqdm import tqdm
-
-IGNORE_INDEX = -100
 
 
-def _process_rank() -> int:
-    """Return the current distributed rank from torch or launcher environment."""
-
-    if dist.is_initialized():
-        return dist.get_rank()
-    for env_name in ("RANK", "SLURM_PROCID"):
-        env_value = os.environ.get(env_name)
-        if env_value is None:
-            continue
-        try:
-            return int(env_value)
-        except ValueError:
-            continue
-    return 0
-
-
-def _is_main_process():
-    return _process_rank() == 0
-
-
-def _launcher_world_size() -> int:
-    """Return the process count from torchrun/launcher environment when available."""
-
-    for env_name in ("WORLD_SIZE", "SLURM_NTASKS"):
-        env_value = os.environ.get(env_name)
-        if env_value is None:
-            continue
-        try:
-            return max(1, int(env_value))
-        except ValueError:
-            continue
-    return 1
-
-
-def _load_json_records(path: str | Path, max_samples: int | None = None) -> list[dict[str, Any]]:
-    """Load JSON or JSONL training records from disk."""
-
-    path = Path(path)
-    if path.suffix == ".jsonl":
-        print(f"Loading JSONL records from {path}")
-        with path.open("r", encoding="utf-8") as f:
-            records = []
-            iterator = tqdm(
-                f,
-                desc=f"Loading {path}",
-                unit=" records",
-                disable=not _is_main_process(),
-                mininterval=10.0 # Update the progress bar at most every 10 seconds to reduce overhead on large logs
-            )
-            for line_no, line in enumerate(iterator, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                if max_samples is not None and len(records) >= max_samples:
-                    break
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
-    else:
-        print(f"Loading JSON records from {path}")
-        with path.open("r", encoding="utf-8") as handle:
-            records = json.load(handle)
-    if not isinstance(records, list):
-        raise ValueError(f"Expected a list of records in {path}")
-    return records
-
-
-def _role_name(raw_role: str) -> str:
-    """Normalize dataset role labels to chat-template role names."""
-
-    role = raw_role.lower()
-    if role in {"human", "user"}:
-        return "user"
-    if role in {"gpt", "assistant"}:
-        return "assistant"
-    return role
-
-
-def _conversation_text(record: dict[str, Any]) -> tuple[str, str]:
-    """Extract the first user prompt and assistant response from a record."""
-
-    conversations = record.get("conversations")
-    if not isinstance(conversations, list):
-        raise ValueError("Each record must contain a conversations list.")
-
-    user_text: str | None = None
-    assistant_text: str | None = None
-    for turn in conversations:
-        if not isinstance(turn, dict):
-            continue
-        role = _role_name(str(turn.get("from", turn.get("role", ""))))
-        value = str(turn.get("value", turn.get("content", "")))
-        if role == "user" and user_text is None:
-            user_text = value
-        elif role == "assistant" and assistant_text is None:
-            assistant_text = value
-
-    if user_text is None or assistant_text is None:
-        raise ValueError("Each pretraining record must contain at least one user turn and one assistant turn.")
-    return user_text, assistant_text
-
-
-def _render_prefix(processor: LlavaAnythingProcessor, user_text: str, system_prompt: str | None = None) -> str:
-    """Render the supervised-learning prompt prefix before assistant tokens."""
-
-    conversation = []
-    if system_prompt:
-        conversation.append({"role": "system", "content": system_prompt})
-    conversation.append({"role": "user", "content": user_text})
-    return processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
-
-
-def _preview_record(
-    processor: LlavaAnythingProcessor,
-    record: dict[str, Any],
-    system_prompt: str | None = None,
-) -> tuple[str, str]:
-    """Render a record into prompt prefix and target assistant text."""
-
-    user_text, assistant_text = _conversation_text(record)
-    return _render_prefix(processor, user_text, system_prompt), assistant_text
-
-
-def log_preview_samples(dataset: "LlavaPretrainDataset", count: int = 2) -> None:
-    """Print a small preview of templated training samples."""
-
-    if count <= 0:
-        return
-    limit = min(count, len(dataset))
-    print(f"Previewing {limit} training sample(s) after prompt templating:")
-    for index in range(limit):
-        rendered_input, expected_output = _preview_record(
-            dataset.processor,
-            dataset.records[index],
-            dataset.system_prompt,
-        )
-        print(f"Sample {index}")
-        print("Rendered input:")
-        print(rendered_input)
-        print("Expected output:")
-        print(expected_output)
-
-
-_TOKENIZER_MODEL_MAX_LENGTH_SENTINEL = 10**20
-
-
-def _resolve_model_max_length(processor: LlavaAnythingProcessor, model_max_length: Any | None = None) -> int | None:
-    """Resolve the training max length from config or the tokenizer."""
-
-    if model_max_length is not None:
-        resolved = int(model_max_length)
-        if resolved <= 0:
-            raise ValueError("model_max_length must be a positive integer when provided.")
-        return resolved
-
-    tokenizer_max_length = getattr(processor.tokenizer, "model_max_length", None)
-    if tokenizer_max_length is None:
-        return None
-    try:
-        resolved = int(tokenizer_max_length)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if resolved <= 0 or resolved >= _TOKENIZER_MODEL_MAX_LENGTH_SENTINEL:
-        return None
-    return resolved
-
-
-def _tokenize_text(
-    processor: LlavaAnythingProcessor,
-    text: str,
-    model_max_length: int | None = None,
-) -> torch.LongTensor:
-    """Tokenize text without adding tokenizer-level special tokens."""
-
-    tokenizer_kwargs = {"add_special_tokens": False}
-    if model_max_length is not None:
-        tokenizer_kwargs.update({"truncation": True, "max_length": model_max_length})
-    encoded = processor(text=text, return_tensors="pt", **tokenizer_kwargs)
-    return encoded["input_ids"][0]
-
-
-class LlavaPretrainDataset(Dataset):
-    """Lazy reader for LLaVA-style image/conversation JSON records."""
+class LlavaAnythingTrainer(Trainer):
+    """Trainer with checks for invalid supervised-loss batches."""
 
     def __init__(
         self,
-        data_path: str | Path,
-        image_folder: str | Path,
-        processor: LlavaAnythingProcessor,
-        max_samples: int | None = None,
-        available_images_only: bool = True,
-        available_images_cache_dir: str | Path | None = None,
-        available_images_num_workers: int = 0,
-        refresh_available_images_cache: bool = False,
-        system_prompt: str | None = None,
-        model_max_length: int | None = None,
+        *args: Any,
+        skip_nonfinite_loss: bool = False,
+        skip_nonfinite_gradients: bool | None = None,
+        max_consecutive_nonfinite_losses: int = 8,
+        finite_parameter_check_steps: int = 0,
+        **kwargs: Any,
     ) -> None:
-        """Load record metadata and optionally filter examples with missing image files."""
-
-        self.data_path = Path(data_path)
-        self.image_folder = Path(image_folder)
-        self.processor = processor
-        self.model_max_length = _resolve_model_max_length(processor, model_max_length)
-        if system_prompt is not None and not isinstance(system_prompt, str):
-            raise TypeError("system_prompt must be a string when provided.")
-        self.system_prompt = system_prompt or None
-        self.max_samples = max_samples
-        self.available_images_cache_dir = (
-            Path(available_images_cache_dir) if available_images_cache_dir else None
+        super().__init__(*args, **kwargs)
+        self.skip_nonfinite_loss = skip_nonfinite_loss
+        self.skip_nonfinite_gradients = (
+            skip_nonfinite_loss if skip_nonfinite_gradients is None else bool(skip_nonfinite_gradients)
         )
-        self.available_images_num_workers = max(0, int(available_images_num_workers))
-        self.refresh_available_images_cache = refresh_available_images_cache
-        records = _load_json_records(self.data_path, max_samples)
-        if available_images_only:
-            records, skipped_count = self._filter_available_records(records)
-            if skipped_count:
-                noun = "image" if skipped_count == 1 else "images"
+        self.nonfinite_loss_batches = 0
+        self.nonfinite_gradient_steps = 0
+        self.max_consecutive_nonfinite_losses = max(1, int(max_consecutive_nonfinite_losses))
+        self._consecutive_nonfinite_losses = 0
+        self._consecutive_nonfinite_loss_windows = 0
+        self._skip_next_optimizer_step = False
+        self._optimizer_step_skip_reason = "this accumulation window was marked unsafe"
+        self._optimizer_step_skip_marked_by_guard = False
+        self._wrapped_optimizer: Any | None = None
+        self._wrapped_deepspeed_backward: Any | None = None
+        self._last_batch_metadata: Any | None = None
+        self._recent_batch_metadata = deque(maxlen=5)
+        self.finite_parameter_check_steps = max(0, int(finite_parameter_check_steps))
+        self._optimizer_step_attempts = 0
+        self._first_training_step_seen = False
+        self._visible_zero3_nonfinite_parameter_warning_count = 0
+        self._start_startup_watchdog()
+
+    @staticmethod
+    def _rank_log(message: str) -> None:
+        print(f"[RANK {_process_rank()}] {message}", flush=True)
+
+    def _start_startup_watchdog(self) -> None:
+        """Dump Python stacks if distributed setup hangs before the first batch."""
+
+        raw_seconds = os.environ.get("LLAVA_TRAINING_STARTUP_WATCHDOG_SECONDS")
+        if not raw_seconds:
+            return
+        try:
+            seconds = int(raw_seconds)
+        except ValueError:
+            warnings.warn(
+                f"Ignoring invalid LLAVA_TRAINING_STARTUP_WATCHDOG_SECONDS={raw_seconds!r}.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
+        if seconds <= 0:
+            return
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+
+        def watchdog() -> None:
+            while not self._first_training_step_seen:
+                time.sleep(seconds)
+                if self._first_training_step_seen:
+                    return
+                print(
+                    f"[RANK {_process_rank()}] No training step reached after another "
+                    f"{seconds}s; dumping Python stacks for startup-hang diagnosis.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+
+        threading.Thread(target=watchdog, name="llava-startup-watchdog", daemon=True).start()
+
+    @staticmethod
+    def _any_rank_should_skip_loss(loss: torch.Tensor) -> bool:
+        """Return whether any distributed rank saw a non-finite loss."""
+
+        local_should_skip = 0 if torch.isfinite(loss.detach()).all() else 1
+        should_skip = torch.tensor(local_should_skip, device=loss.device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(should_skip, op=dist.ReduceOp.MAX)
+        return bool(should_skip.item())
+
+    def _any_rank_should_skip_gradient_norm(self, grad_norm: Any) -> bool:
+        """Return whether any distributed rank saw a non-finite gradient norm."""
+
+        if torch.is_tensor(grad_norm):
+            local_should_skip = 0 if torch.isfinite(grad_norm.detach()).all() else 1
+            device = grad_norm.device
+        else:
+            try:
+                local_should_skip = 0 if torch.isfinite(torch.tensor(float(grad_norm))).item() else 1
+            except (TypeError, ValueError, OverflowError):
+                local_should_skip = 1
+            device = self.args.device
+        should_skip = torch.tensor(local_should_skip, device=device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(should_skip, op=dist.ReduceOp.MAX)
+        return bool(should_skip.item())
+
+    @staticmethod
+    def _skipped_loss_like(loss: torch.Tensor) -> torch.Tensor:
+        """Return a scalar finite loss accepted by DeepSpeed backward."""
+
+        zero_source = torch.zeros((), device=loss.device, dtype=torch.float32, requires_grad=True)
+        return zero_source * 0.0
+
+    def _mark_optimizer_step_skipped(self) -> None:
+        """Make Accelerate report that the current optimizer step was skipped."""
+
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None and hasattr(optimizer, "_is_overflow"):
+            optimizer._is_overflow = True
+            self._optimizer_step_skip_marked_by_guard = True
+
+    def _request_optimizer_step_skip(self, reason: str) -> None:
+        self._skip_next_optimizer_step = True
+        self._optimizer_step_skip_reason = reason
+        self._mark_optimizer_step_skipped()
+
+    def _consume_optimizer_step_skip(self) -> str:
+        reason = getattr(self, "_optimizer_step_skip_reason", "this accumulation window was marked unsafe")
+        self._skip_next_optimizer_step = False
+        self._optimizer_step_skip_reason = "this accumulation window was marked unsafe"
+        return reason
+
+    @staticmethod
+    def _is_nonfinite_loss_skip_reason(reason: str) -> bool:
+        return "non-finite loss" in reason
+
+    def _record_skipped_optimizer_window(self, reason: str) -> bool:
+        if self._is_nonfinite_loss_skip_reason(reason):
+            self._consecutive_nonfinite_loss_windows += 1
+            return self._consecutive_nonfinite_loss_windows >= self.max_consecutive_nonfinite_losses
+        return False
+
+    def _persistent_nonfinite_loss_error(self) -> RuntimeError:
+        state_bad, state_message = self._any_rank_has_nonfinite_training_state()
+        state_status = (
+            f"non-finite training state detected: {state_message}"
+            if state_bad
+            else f"no non-finite training state detected locally: {state_message}"
+        )
+        return RuntimeError(
+            "Persistent non-finite training loss detected after "
+            f"{self._consecutive_nonfinite_loss_windows} consecutive skipped optimizer window(s). "
+            "The model state may be non-finite or this shard is repeatedly producing invalid losses. "
+            f"state_check={state_status}. "
+            f"recent_batches={self._format_recent_batch_metadata()}"
+        )
+
+    @staticmethod
+    def _format_batch_metadata(metadata: Any, limit: int = 4) -> str:
+        """Format compact batch metadata for warnings without flooding Slurm logs."""
+
+        if not metadata:
+            return ""
+        items = list(metadata) if isinstance(metadata, (list, tuple)) else [metadata]
+        formatted: list[str] = []
+        for item in items[:limit]:
+            if isinstance(item, dict):
+                fields = []
+                if "record_index" in item:
+                    fields.append(f"idx={item['record_index']}")
+                if "record_id" in item:
+                    fields.append(f"id={item['record_id']!r}")
+                if "image_path" in item:
+                    fields.append(f"image={item['image_path']!r}")
+                formatted.append("{" + ", ".join(fields) + "}" if fields else repr(item))
+            else:
+                formatted.append(repr(item))
+        remaining = len(items) - limit
+        if remaining > 0:
+            formatted.append(f"... +{remaining} more")
+        return " batch_metadata=[" + "; ".join(formatted) + "]"
+
+    def _format_recent_batch_metadata(self) -> str:
+        """Format the current batch plus recent predecessors for first-NaN debugging."""
+
+        if not self._recent_batch_metadata:
+            return ""
+        formatted_batches = []
+        recent = list(self._recent_batch_metadata)
+        for offset, metadata in enumerate(recent):
+            distance = len(recent) - offset - 1
+            label = "current" if distance == 0 else f"prev_{distance}"
+            formatted = self._format_batch_metadata(metadata, limit=2).strip()
+            formatted_batches.append(f"{label}: {formatted or 'batch_metadata=[]'}")
+        return " recent_batches=[" + " | ".join(formatted_batches) + "]"
+
+    def _wrap_optimizer_step_if_needed(self) -> None:
+        """Guard optimizer.step so skipped non-finite windows cannot update weights."""
+
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is None:
+            return
+        if not hasattr(optimizer, "step"):
+            return
+        if optimizer is self._wrapped_optimizer and getattr(
+            optimizer.step, "_llava_anything_nonfinite_guard", False
+        ):
+            return
+
+        original_step = optimizer.step
+
+        def guarded_step(*args: Any, **kwargs: Any) -> Any:
+            if self._skip_next_optimizer_step:
+                reason = self._consume_optimizer_step_skip()
+                self._mark_optimizer_step_skipped()
+                should_abort = self._record_skipped_optimizer_window(reason)
                 warnings.warn(
-                    f"{skipped_count} {noun} not found and skipping those before training.",
+                    f"[rank {_process_rank()}] Skipping optimizer step because {reason}.",
                     UserWarning,
                     stacklevel=2,
                 )
-        if max_samples is not None:
-            records = records[:max_samples]
-        self.records = records
+                if should_abort:
+                    raise self._persistent_nonfinite_loss_error()
+                return None
+            if self._optimizer_step_skip_marked_by_guard and hasattr(optimizer, "_is_overflow"):
+                optimizer._is_overflow = False
+                self._optimizer_step_skip_marked_by_guard = False
+            result = original_step(*args, **kwargs)
+            if not self._deepspeed_engine():
+                self._after_actual_optimizer_step()
+            return result
 
-    def __len__(self) -> int:
-        """Return the number of available training records."""
+        guarded_step._llava_anything_nonfinite_guard = True
+        if getattr(original_step, "_wrapped_by_lr_sched", False):
+            guarded_step._wrapped_by_lr_sched = True
+        optimizer.step = guarded_step
+        self._wrapped_optimizer = optimizer
 
-        return len(self.records)
+    def create_optimizer(self, model: torch.nn.Module | None = None) -> torch.optim.Optimizer:
+        self._rank_log("Entering Trainer.create_optimizer().")
+        optimizer = super().create_optimizer(model=model)
+        self._rank_log(f"Finished Trainer.create_optimizer(): {type(optimizer).__name__}.")
+        self._wrap_optimizer_step_if_needed()
+        return optimizer
 
-    def _record_image_path(self, record: dict[str, Any]) -> Path:
-        """Resolve a record's image path relative to the dataset image folder."""
-
-        image_name = record.get("image")
-        if not image_name:
-            raise ValueError("Pretraining records must include an image path.")
-        return self.image_folder / str(image_name)
-
-    def _record_has_image(self, record: dict[str, Any]) -> bool:
-        """Return whether a record declares an image input."""
-
-        return bool(record.get("image"))
-
-    def _record_has_available_image(self, record: dict[str, Any]) -> bool:
-        """Return whether a record points to an existing image file."""
-
-        image_name = record.get("image")
-        if not image_name:
-            return False
-        return (self.image_folder / str(image_name)).is_file()
-
-    def _record_is_available(self, record: dict[str, Any]) -> bool:
-        """Return whether a record should be kept after image availability filtering."""
-
-        if not self._record_has_image(record):
-            return True
-        return self._record_has_available_image(record)
-
-    def _available_images_cache_path(self) -> Path | None:
-        """Return the cache file used for missing image indices."""
-
-        if self.available_images_cache_dir is None:
-            return None
-        return self.available_images_cache_dir / "skipped_image_indices.json"
-
-    def _available_images_cache_metadata(self, record_count: int) -> dict[str, Any]:
-        """Build cache metadata that ties skipped indices to this dataset input."""
-
+    def get_train_dataloader(self) -> torch.utils.data.DataLoader:
+        self._rank_log("Building train dataloader.")
+        dataloader = super().get_train_dataloader()
         try:
-            data_stat = self.data_path.stat()
-            data_size = data_stat.st_size
-            data_mtime_ns = data_stat.st_mtime_ns
-        except OSError:
-            data_size = None
-            data_mtime_ns = None
+            length = len(dataloader)
+        except TypeError:
+            length = "unknown"
+        self._rank_log(f"Built train dataloader with length={length}.")
+        return dataloader
 
-        return {
-            "version": 1,
-            "data_path": str(self.data_path.resolve()),
-            "data_size": data_size,
-            "data_mtime_ns": data_mtime_ns,
-            "image_folder": str(self.image_folder.resolve()),
-            "max_samples": self.max_samples,
-            "record_count": record_count,
-        }
+    def _prepare_for_training(
+        self,
+        max_steps: int,
+        train_dataloader: torch.utils.data.DataLoader,
+        resume_from_checkpoint: str | bool | None,
+    ) -> tuple[torch.nn.Module, torch.utils.data.DataLoader]:
+        self._rank_log("Entering Trainer._prepare_for_training().")
+        result = super()._prepare_for_training(max_steps, train_dataloader, resume_from_checkpoint)
+        self._rank_log("Finished Trainer._prepare_for_training().")
+        return result
 
-    def _load_skipped_indices_cache(self, records: list[dict[str, Any]]) -> set[int] | None:
-        """Load cached missing-image indices when the cache still matches the dataset."""
+    def _deepspeed_engine(self) -> Any | None:
+        accelerator = getattr(self, "accelerator", None)
+        wrapped = getattr(accelerator, "deepspeed_engine_wrapped", None)
+        return getattr(wrapped, "engine", None)
 
-        cache_path = self._available_images_cache_path()
+    def _deepspeed_zero_optimizer(self) -> Any | None:
+        engine = self._deepspeed_engine()
+        return getattr(engine, "optimizer", None)
+
+    def _after_actual_optimizer_step(self) -> None:
+        self._optimizer_step_attempts = getattr(self, "_optimizer_step_attempts", 0) + 1
+        self._consecutive_nonfinite_losses = 0
+        self._consecutive_nonfinite_loss_windows = 0
         if (
-            cache_path is None
-            or self.refresh_available_images_cache
-            or not cache_path.is_file()
+            getattr(self, "finite_parameter_check_steps", 0)
+            and self._optimizer_step_attempts <= self.finite_parameter_check_steps
         ):
+            self._raise_if_any_rank_has_nonfinite_training_state()
+
+    @staticmethod
+    def _tensor_nonfinite_summary(label: str, tensor: torch.Tensor) -> str | None:
+        if not (torch.is_floating_point(tensor) or torch.is_complex(tensor)):
             return None
-
-        try:
-            with cache_path.open("r", encoding="utf-8") as handle:
-                cache = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            warnings.warn(
-                f"Ignoring unavailable image cache at {cache_path}: {exc}",
-                UserWarning,
-                stacklevel=2,
-            )
+        if tensor.numel() == 0:
             return None
-
-        expected_metadata = self._available_images_cache_metadata(len(records))
-        if cache.get("metadata") != expected_metadata:
+        finite = torch.isfinite(tensor)
+        if bool(finite.all()):
             return None
+        nonfinite = int((~finite).sum().item())
+        return f"{label}: shape={tuple(tensor.shape)} dtype={tensor.dtype} nonfinite={nonfinite}"
 
-        skipped_indices = cache.get("skipped_indices")
-        if not isinstance(skipped_indices, list) or not all(
-            isinstance(index, int) for index in skipped_indices
-        ):
-            warnings.warn(
-                f"Ignoring malformed unavailable image cache at {cache_path}.",
-                UserWarning,
-                stacklevel=2,
-            )
-            return None
-
-        skipped = set(skipped_indices)
-        if any(index < 0 or index >= len(records) for index in skipped):
-            warnings.warn(
-                f"Ignoring out-of-range unavailable image cache at {cache_path}.",
-                UserWarning,
-                stacklevel=2,
-            )
-            return None
-
-        if _is_main_process():
-            print(
-                f"Loaded {len(skipped)} cached skipped image index/indices from {cache_path}"
-            )
-        return skipped
-
-    def _wait_for_skipped_indices_cache(
+    def _append_nonfinite_tensor_tree_summaries(
         self,
-        records: list[dict[str, Any]],
-        poll_seconds: float = 10.0,
-    ) -> set[int]:
-        """Wait for rank 0 to write a valid skipped-index cache."""
-
-        cache_path = self._available_images_cache_path()
-        if cache_path is None:
-            raise RuntimeError("Cannot wait for skipped image cache without a cache path.")
-
-        while True:
-            if cache_path.is_file():
-                cached_skipped_indices = self._load_skipped_indices_cache(records)
-                if cached_skipped_indices is not None:
-                    return cached_skipped_indices
-            time.sleep(poll_seconds)
-
-    def _save_skipped_indices_cache(
-        self,
-        records: list[dict[str, Any]],
-        skipped_indices: list[int],
+        summaries: list[str],
+        label: str,
+        value: Any,
+        limit: int,
     ) -> None:
-        """Persist missing-image indices for faster restarts on the same dataset."""
+        if len(summaries) >= limit:
+            return
+        if torch.is_tensor(value):
+            summary = self._tensor_nonfinite_summary(label, value.detach())
+            if summary is not None:
+                summaries.append(summary)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                self._append_nonfinite_tensor_tree_summaries(summaries, f"{label}[{key!r}]", item, limit)
+                if len(summaries) >= limit:
+                    return
+            return
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                self._append_nonfinite_tensor_tree_summaries(summaries, f"{label}[{index}]", item, limit)
+                if len(summaries) >= limit:
+                    return
 
-        cache_path = self._available_images_cache_path()
-        if cache_path is None or not _is_main_process():
+    @staticmethod
+    def _zero3_parameter_is_available(parameter: torch.nn.Parameter) -> bool:
+        """Return whether a ZeRO-3 parameter's visible tensor data is real."""
+
+        status = getattr(parameter, "ds_status", None)
+        if status is None:
+            return True
+        return getattr(status, "name", None) == "AVAILABLE"
+
+    def _local_nonfinite_gradient_summaries(self, limit: int = 8) -> list[str]:
+        summaries: list[str] = []
+        model = getattr(self, "model", None)
+        if model is not None:
+            for name, parameter in model.named_parameters():
+                grad = getattr(parameter, "grad", None)
+                if grad is None:
+                    continue
+                summary = self._tensor_nonfinite_summary(f"{name}.grad", grad.detach())
+                if summary is not None:
+                    summaries.append(summary)
+                    if len(summaries) >= limit:
+                        return summaries
+
+        zero_optimizer = self._deepspeed_zero_optimizer()
+        if zero_optimizer is None:
+            return summaries
+
+        norm_for_param_grads = getattr(zero_optimizer, "norm_for_param_grads", {})
+        if isinstance(norm_for_param_grads, dict):
+            for param_id, norm in norm_for_param_grads.items():
+                if torch.is_tensor(norm):
+                    summary = self._tensor_nonfinite_summary(
+                        f"deepspeed.norm_for_param_grads[{param_id}]",
+                        norm.detach(),
+                    )
+                    if summary is not None:
+                        summaries.append(summary)
+                else:
+                    try:
+                        if not torch.isfinite(torch.tensor(float(norm))).item():
+                            summaries.append(f"deepspeed.norm_for_param_grads[{param_id}]: value={norm!r}")
+                    except (TypeError, ValueError, OverflowError):
+                        summaries.append(f"deepspeed.norm_for_param_grads[{param_id}]: value={norm!r}")
+                if len(summaries) >= limit:
+                    return summaries
+
+        grad_partitions_flat_buffer = getattr(zero_optimizer, "grad_partitions_flat_buffer", None)
+        self._append_nonfinite_tensor_tree_summaries(
+            summaries,
+            "deepspeed.grad_partitions_flat_buffer",
+            grad_partitions_flat_buffer,
+            limit,
+        )
+        if len(summaries) >= limit:
+            return summaries
+
+        averaged_gradients = getattr(zero_optimizer, "averaged_gradients", None)
+        self._append_nonfinite_tensor_tree_summaries(
+            summaries,
+            "deepspeed.averaged_gradients",
+            averaged_gradients,
+            limit,
+        )
+        if len(summaries) >= limit:
+            return summaries
+
+        fp32_groups = getattr(zero_optimizer, "fp32_partitioned_groups_flat", [])
+        for group_index, flat_param in enumerate(fp32_groups):
+            grad = getattr(flat_param, "grad", None)
+            if grad is None:
+                continue
+            summary = self._tensor_nonfinite_summary(
+                f"deepspeed.fp32_partitioned_groups_flat[{group_index}].grad",
+                grad.detach(),
+            )
+            if summary is not None:
+                summaries.append(summary)
+                if len(summaries) >= limit:
+                    return summaries
+
+        return summaries
+
+    def _any_rank_has_nonfinite_gradient_state(self) -> tuple[bool, str]:
+        summaries = self._local_nonfinite_gradient_summaries()
+        local_bad = 1 if summaries else 0
+        bad = torch.tensor(local_bad, device=self.args.device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        local_message = "; ".join(summaries) if summaries else "no local non-finite gradient state"
+        return bool(bad.item()), local_message
+
+    def _clear_deepspeed_gradient_state(self) -> None:
+        engine = self._deepspeed_engine()
+        zero_optimizer = self._deepspeed_zero_optimizer()
+        if zero_optimizer is not None:
+            if hasattr(zero_optimizer, "zero_grad"):
+                zero_optimizer.zero_grad(set_to_none=True)
+            if hasattr(zero_optimizer, "reset_cpu_buffers"):
+                zero_optimizer.reset_cpu_buffers()
+            if hasattr(zero_optimizer, "averaged_gradients"):
+                zero_optimizer.averaged_gradients = {}
+            grad_partitions_flat_buffer = getattr(zero_optimizer, "grad_partitions_flat_buffer", None)
+            if torch.is_tensor(grad_partitions_flat_buffer):
+                grad_partitions_flat_buffer.zero_()
+            fp32_groups = getattr(zero_optimizer, "fp32_partitioned_groups_flat", [])
+            for flat_param in fp32_groups:
+                grad = getattr(flat_param, "grad", None)
+                if torch.is_tensor(grad):
+                    grad.zero_()
+        if engine is not None and hasattr(engine, "zero_grad"):
+            engine.zero_grad()
+
+    def _run_deepspeed_overflow_cleanup_step(self, engine: Any) -> None:
+        """Run DeepSpeed's native skipped-step cleanup without updating parameters."""
+
+        zero_optimizer = self._deepspeed_zero_optimizer()
+        if zero_optimizer is not None and hasattr(zero_optimizer, "overflow"):
+            zero_optimizer.overflow = True
+        engine.step()
+        if zero_optimizer is not None and hasattr(zero_optimizer, "overflow"):
+            zero_optimizer.overflow = False
+
+    def _wrap_deepspeed_backward_if_needed(self) -> None:
+        accelerator = getattr(self, "accelerator", None)
+        wrapped = getattr(accelerator, "deepspeed_engine_wrapped", None)
+        if wrapped is None:
+            return
+        if wrapped is self._wrapped_deepspeed_backward and getattr(
+            wrapped.backward, "_llava_anything_nonfinite_guard", False
+        ):
             return
 
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache = {
-            "metadata": self._available_images_cache_metadata(len(records)),
-            "skipped_indices": skipped_indices,
-        }
-        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
-        try:
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                json.dump(cache, handle)
-            os.replace(tmp_path, cache_path)
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
+        original_backward = wrapped.backward
 
-        if _is_main_process():
-            print(
-                f"Saved {len(skipped_indices)} skipped image index/indices to {cache_path}"
-            )
+        def guarded_backward(loss: torch.Tensor, sync_gradients: bool = True, **kwargs: Any) -> Any:
+            engine = wrapped.engine
+            engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
+            result = engine.backward(loss, **kwargs)
+            if not sync_gradients:
+                return result
 
-    def _filter_available_records(
-        self,
-        records: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], int]:
-        """Keep text-only records and image records with existing files."""
-
-        cached_skipped_indices = self._load_skipped_indices_cache(records)
-        if cached_skipped_indices is not None:
-            available = [
-                record
-                for index, record in enumerate(records)
-                if index not in cached_skipped_indices
-            ]
-            return available, len(cached_skipped_indices)
-
-        if (
-            not _is_main_process()
-            and _launcher_world_size() > 1
-            and self._available_images_cache_path() is not None
-            and not self.refresh_available_images_cache
-        ):
-            cached_skipped_indices = self._wait_for_skipped_indices_cache(records)
-            available = [
-                record
-                for index, record in enumerate(records)
-                if index not in cached_skipped_indices
-            ]
-            return available, len(cached_skipped_indices)
-
-        available: list[dict[str, Any]] = []
-        skipped_indices: list[int] = []
-        worker_count = self.available_images_num_workers
-        if worker_count > 1 and _is_main_process():
-            print(f"Checking image availability with {worker_count} workers")
-
-        def collect(is_available_by_index) -> None:
-            for index, (record, is_available) in enumerate(
-                zip(records, is_available_by_index)
-            ):
-                if is_available:
-                    available.append(record)
+            if self._skip_next_optimizer_step:
+                reason = self._consume_optimizer_step_skip()
+                self._mark_optimizer_step_skipped()
+                should_abort = self._record_skipped_optimizer_window(reason)
+                if self._is_nonfinite_loss_skip_reason(reason):
+                    self._run_deepspeed_overflow_cleanup_step(engine)
                 else:
-                    skipped_indices.append(index)
-
-        if worker_count <= 1:
-            is_available_iter = (
-                self._record_is_available(record)
-                for record in tqdm(
-                    records,
-                    disable=not _is_main_process(),
-                    mininterval=10.0,
-                    desc="Checking for available images",
+                    self._clear_deepspeed_gradient_state()
+                warnings.warn(
+                    f"[rank {_process_rank()}] Skipping DeepSpeed optimizer step because "
+                    f"{reason}.",
+                    UserWarning,
+                    stacklevel=2,
                 )
-            )
-            collect(is_available_iter)
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                is_available_iter = tqdm(
-                    executor.map(self._record_is_available, records),
-                    total=len(records),
-                    disable=not _is_main_process(),
-                    mininterval=10.0,
-                    desc="Checking for available images",
+                if should_abort:
+                    raise self._persistent_nonfinite_loss_error()
+                return result
+
+            should_skip, gradient_message = self._any_rank_has_nonfinite_gradient_state()
+            if self.skip_nonfinite_gradients and should_skip:
+                self.nonfinite_gradient_steps += 1
+                self._request_optimizer_step_skip(f"DeepSpeed gradient state is non-finite: {gradient_message}")
+                reason = self._consume_optimizer_step_skip()
+                self._clear_deepspeed_gradient_state()
+                warnings.warn(
+                    f"[rank {_process_rank()}] Skipping DeepSpeed optimizer step because "
+                    f"{reason}. "
+                    f"recent_batches={self._format_recent_batch_metadata()}",
+                    UserWarning,
+                    stacklevel=2,
                 )
-                collect(is_available_iter)
-        self._save_skipped_indices_cache(records, skipped_indices)
-        return available, len(skipped_indices)
+                return result
 
-    def _load_image(self, record: dict[str, Any]) -> Image.Image:
-        """Load a record image as RGB PIL data."""
+            engine.step()
+            self._after_actual_optimizer_step()
+            return result
 
-        image_path = self._record_image_path(record)
-        return Image.open(image_path).convert("RGB")
+        guarded_backward._llava_anything_nonfinite_guard = True
+        guarded_backward._llava_anything_original_backward = original_backward
+        wrapped.backward = guarded_backward
+        self._wrapped_deepspeed_backward = wrapped
 
-    def _tokenizer_kwargs(self) -> dict[str, Any]:
-        """Return text-tokenization kwargs used by all training samples."""
+    def _local_nonfinite_parameter_summaries(self, limit: int = 8) -> list[str]:
+        summaries: list[str] = []
+        zero_optimizer = self._deepspeed_zero_optimizer()
 
-        kwargs: dict[str, Any] = {"add_special_tokens": False}
-        if self.model_max_length is not None:
-            kwargs.update({"truncation": True, "max_length": self.model_max_length})
-        return kwargs
+        # ZeRO-3 swaps/gathers/repartitions model parameters around engine.step().
+        # The visible bf16 Parameter tensors can be transient views, so use
+        # DeepSpeed's fp32 partitioned tensors as the authoritative local state.
+        if zero_optimizer is None:
+            for name, parameter in self.model.named_parameters():
+                if not self._zero3_parameter_is_available(parameter):
+                    continue
+                data = parameter.detach()
+                if not (torch.is_floating_point(data) or torch.is_complex(data)):
+                    continue
+                if data.numel() == 0:
+                    continue
+                finite = torch.isfinite(data)
+                if not bool(finite.all()):
+                    nonfinite = int((~finite).sum().item())
+                    summaries.append(
+                        f"{name}: shape={tuple(data.shape)} dtype={data.dtype} nonfinite={nonfinite}"
+                    )
+                    if len(summaries) >= limit:
+                        break
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Build one supervised training sample, with images when present."""
+        if len(summaries) >= limit:
+            return summaries
 
-        record = self.records[index]
-        prefix, assistant_text = _preview_record(self.processor, record, self.system_prompt)
-        eos = self.processor.tokenizer.eos_token or ""
-        full_text = f"{prefix}{assistant_text}{eos}"
+        if zero_optimizer is not None:
+            fp32_groups = getattr(zero_optimizer, "fp32_partitioned_groups_flat", [])
+            for group_index, flat_param in enumerate(fp32_groups):
+                if not torch.is_tensor(flat_param):
+                    continue
+                data = flat_param.detach()
+                if not torch.is_floating_point(data):
+                    continue
+                if data.numel() == 0:
+                    continue
+                finite = torch.isfinite(data)
+                if not bool(finite.all()):
+                    nonfinite = int((~finite).sum().item())
+                    summaries.append(
+                        "deepspeed.fp32_partitioned_groups_flat"
+                        f"[{group_index}]: shape={tuple(data.shape)} dtype={data.dtype} nonfinite={nonfinite}"
+                    )
+                    if len(summaries) >= limit:
+                        break
+        return summaries
 
-        has_image = self._record_has_image(record)
-        image_token = self.processor.image_token
-        if not has_image and image_token in full_text:
-            raise ValueError("Text-only records must not contain the image token.")
+    def _local_visible_zero3_nonfinite_parameter_summaries(self, limit: int = 8) -> list[str]:
+        summaries: list[str] = []
+        if self._deepspeed_zero_optimizer() is None:
+            return summaries
+        model = getattr(self, "model", None)
+        if model is None:
+            return summaries
+        for name, parameter in model.named_parameters():
+            data = parameter.detach()
+            if not (torch.is_floating_point(data) or torch.is_complex(data)):
+                continue
+            if data.numel() == 0:
+                continue
+            finite = torch.isfinite(data)
+            if bool(finite.all()):
+                continue
+            nonfinite = int((~finite).sum().item())
+            summaries.append(f"{name}: shape={tuple(data.shape)} dtype={data.dtype} nonfinite={nonfinite}")
+            if len(summaries) >= limit:
+                break
+        return summaries
 
-        if has_image and getattr(self.processor, "image_mode", "fixed") == "anyres":
-            image = self._load_image(record)
-            full_inputs = self.processor(images=image, text=full_text, return_tensors="pt", **self._tokenizer_kwargs())
-            prefix_inputs = self.processor(images=image, text=prefix, return_tensors="pt", **self._tokenizer_kwargs())
-            input_ids = full_inputs["input_ids"][0]
-            prefix_ids = prefix_inputs["input_ids"][0]
-            image_inputs = full_inputs
-        else:
-            input_ids = _tokenize_text(self.processor, full_text, self.model_max_length)
-            prefix_ids = _tokenize_text(self.processor, prefix, self.model_max_length)
-            image_inputs = self.processor(images=self._load_image(record), return_tensors="pt") if has_image else {}
+    def _warn_if_visible_zero3_parameters_nonfinite(self) -> None:
+        summaries = self._local_visible_zero3_nonfinite_parameter_summaries()
+        if not summaries:
+            return
+        self._visible_zero3_nonfinite_parameter_warning_count = getattr(
+            self,
+            "_visible_zero3_nonfinite_parameter_warning_count",
+            0,
+        ) + 1
+        if self._visible_zero3_nonfinite_parameter_warning_count > 3:
+            return
+        warnings.warn(
+            f"[rank {_process_rank()}] Detected non-finite visible ZeRO-3 model parameter views "
+            "while DeepSpeed fp32 master parameters remain the authoritative training state. "
+            "Treating these visible views as diagnostic only. "
+            f"visible_summaries={'; '.join(summaries)}",
+            UserWarning,
+            stacklevel=2,
+        )
 
-        labels = input_ids.clone()
-        labels[: prefix_ids.shape[0]] = IGNORE_INDEX
-        labels[input_ids == self.processor.tokenizer.convert_tokens_to_ids(image_token)] = IGNORE_INDEX
+    def _local_nonfinite_buffer_summaries(self, limit: int = 8) -> list[str]:
+        summaries: list[str] = []
+        model = getattr(self, "model", None)
+        if model is None:
+            return summaries
+        for name, buffer in model.named_buffers():
+            summary = self._tensor_nonfinite_summary(name, buffer.detach())
+            if summary is not None:
+                summaries.append(summary)
+                if len(summaries) >= limit:
+                    break
+        return summaries
 
-        sample = {
-            "input_ids": input_ids,
-            "labels": labels,
-        }
-        if image_inputs:
-            sample["pixel_values"] = image_inputs["pixel_values"][0]
-        if "image_sizes" in image_inputs:
-            sample["image_sizes"] = image_inputs["image_sizes"][0]
-        return sample
+    def _local_nonfinite_optimizer_state_summaries(self, limit: int = 8) -> list[str]:
+        summaries: list[str] = []
+        candidates: list[tuple[str, Any]] = []
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            candidates.append(("trainer.optimizer", optimizer))
+        zero_optimizer = self._deepspeed_zero_optimizer()
+        if zero_optimizer is not None:
+            candidates.append(("deepspeed.optimizer", zero_optimizer))
+            inner_optimizer = getattr(zero_optimizer, "optimizer", None)
+            if inner_optimizer is not None and inner_optimizer is not zero_optimizer:
+                candidates.append(("deepspeed.optimizer.optimizer", inner_optimizer))
 
-
-@dataclass
-class LlavaPretrainDataCollator:
-    tokenizer: Any
-
-    def _pad_sequence(self, tensors: list[torch.Tensor], padding_value: int) -> torch.Tensor:
-        """Pad token sequences while respecting the tokenizer padding side."""
-
-        if getattr(self.tokenizer, "padding_side", "right") == "left":
-            tensors = [torch.flip(tensor, dims=[0]) for tensor in tensors]
-            padded = pad_sequence(tensors, batch_first=True, padding_value=padding_value)
-            return torch.flip(padded, dims=[1])
-        return pad_sequence(tensors, batch_first=True, padding_value=padding_value)
-
-    def __call__(self, instances: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        """Collate text plus any available image tensors into a batch."""
-
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
-
-        input_ids = self._pad_sequence([instance["input_ids"] for instance in instances], pad_token_id)
-        labels = self._pad_sequence([instance["labels"] for instance in instances], IGNORE_INDEX)
-        attention_mask = input_ids.ne(pad_token_id)
-        batch = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-        image_instances = [instance for instance in instances if "pixel_values" in instance]
-        if image_instances:
-            pixel_value_tensors = [instance["pixel_values"] for instance in image_instances]
-            if pixel_value_tensors[0].dim() == 4:
-                max_patches = max(tensor.shape[0] for tensor in pixel_value_tensors)
-                padded_pixel_values = []
-                for tensor in pixel_value_tensors:
-                    if tensor.shape[0] < max_patches:
-                        padding = torch.zeros(
-                            (max_patches - tensor.shape[0], *tensor.shape[1:]),
-                            dtype=tensor.dtype,
-                            device=tensor.device,
+        seen: set[int] = set()
+        for optimizer_label, optimizer_obj in candidates:
+            if id(optimizer_obj) in seen:
+                continue
+            seen.add(id(optimizer_obj))
+            state = getattr(optimizer_obj, "state", None)
+            if not isinstance(state, dict):
+                continue
+            for state_index, state_value in enumerate(state.values()):
+                if torch.is_tensor(state_value):
+                    summary = self._tensor_nonfinite_summary(
+                        f"{optimizer_label}.state[{state_index}]",
+                        state_value.detach(),
+                    )
+                    if summary is not None:
+                        summaries.append(summary)
+                elif isinstance(state_value, dict):
+                    for item_key, item_value in state_value.items():
+                        if not torch.is_tensor(item_value):
+                            continue
+                        summary = self._tensor_nonfinite_summary(
+                            f"{optimizer_label}.state[{state_index}][{item_key!r}]",
+                            item_value.detach(),
                         )
-                        tensor = torch.cat([tensor, padding], dim=0)
-                    padded_pixel_values.append(tensor)
-                batch["pixel_values"] = torch.stack(padded_pixel_values)
-            else:
-                batch["pixel_values"] = torch.stack(pixel_value_tensors)
+                        if summary is not None:
+                            summaries.append(summary)
+                        if len(summaries) >= limit:
+                            return summaries
+                if len(summaries) >= limit:
+                    return summaries
+        return summaries
 
-        image_size_tensors = [instance["image_sizes"] for instance in image_instances if "image_sizes" in instance]
-        if image_size_tensors:
-            batch["image_sizes"] = torch.stack(image_size_tensors)
-        return batch
+    def _local_nonfinite_training_state_summaries(self, limit: int = 8) -> list[str]:
+        summaries = self._local_nonfinite_parameter_summaries(limit=limit)
+        if len(summaries) >= limit:
+            return summaries
+        summaries.extend(self._local_nonfinite_buffer_summaries(limit=limit - len(summaries)))
+        if len(summaries) >= limit:
+            return summaries
+        summaries.extend(self._local_nonfinite_optimizer_state_summaries(limit=limit - len(summaries)))
+        return summaries
+
+    def _any_rank_has_nonfinite_training_state(self) -> tuple[bool, str]:
+        summaries = self._local_nonfinite_training_state_summaries()
+        local_bad = 1 if summaries else 0
+        bad = torch.tensor(local_bad, device=self.args.device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        local_message = "; ".join(summaries) if summaries else "no local non-finite training state"
+        return bool(bad.item()), local_message
+
+    def _raise_if_any_rank_has_nonfinite_parameter(self) -> None:
+        summaries = self._local_nonfinite_parameter_summaries()
+        local_bad = 1 if summaries else 0
+        device = self.args.device
+        bad = torch.tensor(local_bad, device=device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        if bool(bad.item()):
+            local_message = "; ".join(summaries) if summaries else "no local non-finite parameter shard"
+            raise RuntimeError(
+                "Non-finite model parameter detected after optimizer step "
+                f"{self._optimizer_step_attempts} on rank {_process_rank()}: {local_message}. "
+                f"recent_batches={self._format_recent_batch_metadata()}"
+            )
+
+    def _raise_if_any_rank_has_nonfinite_training_state(self) -> None:
+        self._warn_if_visible_zero3_parameters_nonfinite()
+        bad, message = self._any_rank_has_nonfinite_training_state()
+        if bad:
+            raise RuntimeError(
+                "Non-finite training state detected after optimizer step "
+                f"{self._optimizer_step_attempts} on rank {_process_rank()}: {message}. "
+                f"recent_batches={self._format_recent_batch_metadata()}"
+            )
+
+    def training_step(
+        self,
+        model: torch.nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        if not self._first_training_step_seen:
+            self._first_training_step_seen = True
+            self._rank_log("First training_step reached.")
+        self._wrap_optimizer_step_if_needed()
+        self._wrap_deepspeed_backward_if_needed()
+        return super().training_step(model, inputs, num_items_in_batch)
+
+    def _get_grad_norm(self, model: torch.nn.Module, grad_norm: Any = None) -> Any:
+        """Return gradient norm and mark unsafe optimizer steps before they corrupt weights."""
+
+        grad_norm = super()._get_grad_norm(model, grad_norm=grad_norm)
+        if self.skip_nonfinite_gradients and self._any_rank_should_skip_gradient_norm(grad_norm):
+            self.nonfinite_gradient_steps += 1
+            self._skip_next_optimizer_step = True
+            warnings.warn(
+                f"[rank {_process_rank()}] Skipping optimizer step because gradient norm is non-finite: "
+                f"{grad_norm!r}. recent_batches={self._format_recent_batch_metadata()}",
+                UserWarning,
+                stacklevel=2,
+            )
+        return grad_norm
+
+    def compute_loss(
+        self,
+        model: torch.nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        return_outputs: bool = False,
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+        batch_metadata = inputs.pop("_metadata", None)
+        self._last_batch_metadata = batch_metadata
+        self._recent_batch_metadata.append(batch_metadata)
+        labels = inputs.get("labels")
+        if torch.is_tensor(labels) and not torch.any(labels != IGNORE_INDEX):
+            raise ValueError("Refusing to train on a batch with no supervised target tokens.")
+
+        result = super().compute_loss(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
+        loss = result[0] if return_outputs else result
+        should_handle_loss = torch.is_tensor(loss) and (
+            self._any_rank_should_skip_loss(loss)
+            if self.skip_nonfinite_loss
+            else not torch.isfinite(loss.detach()).all()
+        )
+        if should_handle_loss:
+            if not self.skip_nonfinite_loss:
+                raise FloatingPointError(f"Non-finite training loss detected: {loss.detach().item()}")
+
+            self.nonfinite_loss_batches += 1
+            self._consecutive_nonfinite_losses += 1
+            self._request_optimizer_step_skip("this accumulation window had a non-finite loss")
+            if self.nonfinite_loss_batches == 1:
+                state_bad, state_message = self._any_rank_has_nonfinite_training_state()
+                if state_bad:
+                    raise RuntimeError(
+                        "Non-finite training state detected at first non-finite loss "
+                        f"after optimizer step {self._optimizer_step_attempts} "
+                        f"on rank {_process_rank()}: {state_message}. "
+                        f"recent_batches={self._format_recent_batch_metadata()}"
+                    )
+                warnings.warn(
+                    f"[rank {_process_rank()}] First non-finite loss did not coincide with "
+                    f"non-finite local parameter, buffer, ZeRO master parameter, or optimizer state. "
+                    f"state_check={state_message}.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            finite_on_this_rank = torch.isfinite(loss.detach()).all()
+            loss_message = "finite peer-skipped loss" if finite_on_this_rank else str(loss.detach().item())
+            metadata_message = self._format_batch_metadata(batch_metadata)
+            recent_metadata_message = (
+                self._format_recent_batch_metadata() if self.nonfinite_loss_batches == 1 else ""
+            )
+            warnings.warn(
+                f"[rank {_process_rank()}] Skipping non-finite training loss "
+                f"{loss_message} at skipped batch #{self.nonfinite_loss_batches}.{metadata_message}"
+                f"{recent_metadata_message}",
+                UserWarning,
+                stacklevel=2,
+            )
+            zero_loss = self._skipped_loss_like(loss)
+            if return_outputs:
+                return zero_loss, result[1]
+            return zero_loss
+        if torch.is_tensor(loss):
+            self._consecutive_nonfinite_losses = 0
+        return result
 
 
 def apply_trainable_modules(model: LlavaAnythingForConditionalGeneration, trainable_modules: str = "projector") -> list[str]:
@@ -613,6 +855,24 @@ def apply_trainable_modules(model: LlavaAnythingForConditionalGeneration, traina
         model.language_model.requires_grad_(True)
 
     return [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+
+
+def apply_frozen_parameter_patterns(
+    model: LlavaAnythingForConditionalGeneration,
+    frozen_parameter_patterns: list[str],
+) -> list[str]:
+    """Freeze trainable parameters whose names match any shell-style pattern."""
+
+    frozen_names: list[str] = []
+    patterns = [pattern.strip() for pattern in frozen_parameter_patterns if pattern.strip()]
+    if not patterns:
+        return frozen_names
+
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and any(fnmatch(name, pattern) for pattern in patterns):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    return frozen_names
 
 
 @dataclass
@@ -663,6 +923,7 @@ def _coerce_training_arguments(training_section: dict[str, Any]) -> TrainingArgu
     if kwargs.get("save_strategy") is False:
         kwargs["save_strategy"] = "no"
     kwargs.setdefault("logging_steps", 1)
+    kwargs.setdefault("logging_nan_inf_filter", False)
     kwargs.setdefault("disable_tqdm", True)
     if "output_dir" not in kwargs:
         raise ValueError("training.output_dir is required.")
@@ -752,11 +1013,13 @@ def _build_model_and_processor(
 def _load_checkpoint_model_and_processor(
     model_checkpoint: str | Path,
     model_kwargs: dict[str, Any] | None = None,
+    processor_checkpoint: str | Path | None = None,
 ) -> tuple[LlavaAnythingForConditionalGeneration, LlavaAnythingProcessor]:
     """Load a saved LLaVa-Anything checkpoint and its processor."""
 
     checkpoint = Path(model_checkpoint)
-    processor = LlavaAnythingProcessor.from_pretrained(checkpoint)
+    processor_source = Path(processor_checkpoint) if processor_checkpoint is not None else checkpoint
+    processor = LlavaAnythingProcessor.from_pretrained(processor_source)
     model = LlavaAnythingForConditionalGeneration.from_pretrained(
         checkpoint,
         **(_coerce_model_kwargs(model_kwargs) or {}),
@@ -794,6 +1057,7 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         model, processor = _load_checkpoint_model_and_processor(
             model_checkpoint,
             model_kwargs=data.get("model_kwargs"),
+            processor_checkpoint=data.get("processor_checkpoint"),
         )
     else:
         model, processor = _build_model_and_processor(
@@ -809,8 +1073,32 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
     training_args_data = dict(training_section)
     training_args_data.pop("trainable_modules", None)
     model_max_length = training_args_data.pop("model_max_length", None)
+    skip_nonfinite_loss = bool(training_args_data.pop("skip_nonfinite_loss", False))
+    skip_nonfinite_gradients = training_args_data.pop("skip_nonfinite_gradients", None)
+    if skip_nonfinite_gradients is not None:
+        skip_nonfinite_gradients = bool(skip_nonfinite_gradients)
+    max_consecutive_nonfinite_losses = int(training_args_data.pop("max_consecutive_nonfinite_losses", 8))
+    finite_parameter_check_steps = int(training_args_data.pop("finite_parameter_check_steps", 0))
+    frozen_parameter_patterns = training_args_data.pop("frozen_parameter_patterns", [])
+    if frozen_parameter_patterns is None:
+        frozen_parameter_patterns = []
+    if isinstance(frozen_parameter_patterns, str):
+        frozen_parameter_patterns = [frozen_parameter_patterns]
+    if not isinstance(frozen_parameter_patterns, list) or not all(
+        isinstance(pattern, str) for pattern in frozen_parameter_patterns
+    ):
+        raise ValueError("training.frozen_parameter_patterns must be a string or list of strings.")
     trainable_names = apply_trainable_modules(model, trainable_modules)
+    frozen_names = apply_frozen_parameter_patterns(model, frozen_parameter_patterns)
+    if frozen_names and _is_main_process():
+        print(f"Froze {len(frozen_names)} trainable parameter(s) matching frozen_parameter_patterns.")
+    trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     dataloader_num_workers = int(training_section.get("dataloader_num_workers") or 0)
+    image_token_mismatch_num_workers = data_section.get("image_token_mismatch_num_workers")
+    if image_token_mismatch_num_workers is None:
+        image_token_mismatch_num_workers = data_section.get("image_token_prefilter_num_workers")
+    if image_token_mismatch_num_workers is not None:
+        image_token_mismatch_num_workers = int(image_token_mismatch_num_workers)
     available_images_cache_dir = data_section.get("available_images_cache_dir")
     if available_images_cache_dir is None and bool(
         data_section.get("available_images_cache", True)
@@ -828,17 +1116,35 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         refresh_available_images_cache=bool(
             data_section.get("refresh_available_images_cache", False)
         ),
+        require_image=bool(data_section.get("require_image", False)),
+        min_image_width=data_section.get("min_image_width"),
+        min_image_height=data_section.get("min_image_height"),
+        max_image_aspect_ratio=data_section.get("max_image_aspect_ratio"),
+        max_image_tokens=data_section.get("max_image_tokens"),
+        image_constraint_prefilter=bool(data_section.get("image_constraint_prefilter", False)),
+        image_constraint_num_workers=data_section.get("image_constraint_num_workers"),
+        image_token_mismatch_prefilter=bool(
+            data_section.get(
+                "image_token_mismatch_prefilter",
+                data_section.get("image_token_prefilter", False),
+            )
+        ),
+        image_token_mismatch_num_workers=image_token_mismatch_num_workers,
         system_prompt=data_section.get("system_prompt"),
         model_max_length=model_max_length,
     )
     log_preview_samples(dataset, int(logging_section.get("preview_samples", 0)))
-    collator = LlavaPretrainDataCollator(processor.tokenizer)
+    collator = LlavaPretrainDataCollator(processor.tokenizer, include_metadata=True)
     training_args = _coerce_training_arguments(training_args_data)
-    trainer = Trainer(
+    trainer = LlavaAnythingTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=collator,
+        skip_nonfinite_loss=skip_nonfinite_loss,
+        skip_nonfinite_gradients=skip_nonfinite_gradients,
+        max_consecutive_nonfinite_losses=max_consecutive_nonfinite_losses,
+        finite_parameter_check_steps=finite_parameter_check_steps,
     )
     resume_from_checkpoint = _resolve_resume_from_checkpoint(training_args)
     if resume_from_checkpoint and _is_main_process():
@@ -854,6 +1160,9 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         output_dir=output_dir,
         trainable_parameter_names=trainable_names,
     )
+
+
+run_pretraining_from_yaml = run_training_from_yaml
 
 
 def main() -> None:
@@ -872,10 +1181,13 @@ __all__ = [
     "IGNORE_INDEX",
     "LlavaPretrainDataCollator",
     "LlavaPretrainDataset",
+    "LlavaAnythingTrainer",
     "LlavaPretrainingResult",
+    "apply_frozen_parameter_patterns",
     "apply_trainable_modules",
     "configure_wandb",
     "log_preview_samples",
+    "run_pretraining_from_yaml",
     "run_training_from_yaml",
 ]
 

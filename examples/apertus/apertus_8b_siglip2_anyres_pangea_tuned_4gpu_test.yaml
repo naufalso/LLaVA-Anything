@@ -1,0 +1,36 @@
+model_checkpoint: checkpoints/apertus-8b-siglip2-anyres-pretrain-projector-256batch
+model_kwargs:
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+data:
+  data_path: data/PangeaInstruct/PangeaIns-Corrected.jsonl
+  image_folder: data/PangeaInstruct
+  system_prompt: "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
+  max_samples: 100000
+
+
+logging:
+  preview_samples: 2
+
+training:
+  output_dir: checkpoints/apertus-8b-siglip2-anyres-pangea-100k-test2
+  deepspeed: configs/deepspeed/zero3_offload.json
+  trainable_modules: full
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  model_max_length: 8192
+  num_train_epochs: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  bf16: true
+  logging_steps: 10
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 2
+  remove_unused_columns: false
+  dataloader_num_workers: 4
+  report_to: ["wandb"]

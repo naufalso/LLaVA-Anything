@@ -6,7 +6,7 @@ import argparse
 import json
 import importlib.util
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from PIL import Image
@@ -14,7 +14,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 import llava_anything  # noqa: F401 - registers Auto classes
 
-from .training import _conversation_text, _load_json_records
+from .dataset import _conversation_text, _load_json_records
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful language and vision assistant. You are able to understand the visual content that the user "
@@ -99,14 +99,40 @@ def generate_response(
 ) -> str:
     """Generate a deterministic text response for one image and prompt."""
 
-    rendered_prompt = _render_prompt(processor, prompt, system_prompt)
-    inputs = processor(images=image, text=rendered_prompt, return_tensors="pt")
+    return generate_responses(
+        model=model,
+        processor=processor,
+        images=[image],
+        prompts=[prompt],
+        system_prompt=system_prompt,
+        max_new_tokens=max_new_tokens,
+    )[0]
+
+
+def generate_responses(
+    model: Any,
+    processor: Any,
+    images: Sequence[Image.Image],
+    prompts: Sequence[str],
+    system_prompt: str | None = None,
+    max_new_tokens: int = 128,
+) -> list[str]:
+    """Generate deterministic text responses for a batch of image and prompt pairs."""
+
+    if len(images) != len(prompts):
+        raise ValueError("images and prompts must have the same length.")
+    if not images:
+        return []
+
+    rendered_prompts = [_render_prompt(processor, prompt, system_prompt) for prompt in prompts]
+    inputs = processor(images=list(images), text=rendered_prompts, padding=True, return_tensors="pt")
     inputs = _move_inputs_to_device(inputs, model.device)
+    input_length = inputs["input_ids"].shape[-1]
 
     with torch.inference_mode():
-        output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
-    return _decode_generated_text(processor, output[0], inputs["input_ids"].shape[-1])
+    return [_decode_generated_text(processor, output, input_length) for output in outputs]
 
 
 def run_single_image(args: argparse.Namespace, model: Any, processor: Any) -> None:
