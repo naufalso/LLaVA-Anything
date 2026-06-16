@@ -33,6 +33,24 @@ conversation with at least one user turn and one assistant turn.
 
 The role names `human`/`gpt` and `user`/`assistant` are both supported.
 
+Hugging Face Datasets with the same record fields are also supported. Use
+`data.hf_dataset_path` instead of `data.data_path`; `data.image_folder` is not
+required when the dataset has a decoded or embedded `Image` column. For the
+LLaVA pretraining dataset on the Hub:
+
+```yaml
+data:
+  hf_dataset_path: naufalso/LLaVA-Pretrain
+  hf_dataset_name: pretrain
+  hf_dataset_split: train
+```
+
+`hf_dataset_name` is the Hugging Face dataset config name and can be omitted for
+single-config datasets. `hf_dataset_config` and `hf_dataset_config_name` are
+accepted aliases. Use `hf_dataset_revision` to pin a branch, tag, or commit.
+If a Hub dataset stores image values as relative strings instead of an `Image`
+column, continue to provide `image_folder` so those paths can be resolved.
+
 ## Stage 1: Projector Training
 
 Stage 1 aligns visual features with the language model. It is usually cheaper

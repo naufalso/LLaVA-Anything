@@ -1104,10 +1104,21 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         data_section.get("available_images_cache", True)
     ):
         available_images_cache_dir = training_section["output_dir"]
+    data_path = data_section.get("data_path")
+    hf_dataset_path = data_section.get("hf_dataset_path")
+    if bool(data_path) == bool(hf_dataset_path):
+        raise ValueError("data must provide exactly one of data_path or hf_dataset_path.")
+    image_folder = data_section.get("image_folder")
+    if data_path is not None and image_folder is None:
+        raise ValueError("data.image_folder is required when data.data_path is used.")
+    hf_dataset_name = data_section.get(
+        "hf_dataset_name",
+        data_section.get("hf_dataset_config", data_section.get("hf_dataset_config_name")),
+    )
 
     dataset = LlavaPretrainDataset(
-        data_path=data_section["data_path"],
-        image_folder=data_section["image_folder"],
+        data_path=data_path,
+        image_folder=image_folder,
         processor=processor,
         max_samples=data_section.get("max_samples"),
         available_images_only=bool(data_section.get("available_images_only", True)),
@@ -1132,6 +1143,10 @@ def run_training_from_yaml(path: str | Path) -> LlavaPretrainingResult:
         image_token_mismatch_num_workers=image_token_mismatch_num_workers,
         system_prompt=data_section.get("system_prompt"),
         model_max_length=model_max_length,
+        hf_dataset_path=hf_dataset_path,
+        hf_dataset_name=hf_dataset_name,
+        hf_dataset_split=data_section.get("hf_dataset_split", "train"),
+        hf_dataset_revision=data_section.get("hf_dataset_revision"),
     )
     log_preview_samples(dataset, int(logging_section.get("preview_samples", 0)))
     collator = LlavaPretrainDataCollator(processor.tokenizer, include_metadata=True)

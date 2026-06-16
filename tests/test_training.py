@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections import deque
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +14,7 @@ import yaml
 from PIL import Image
 from transformers import AutoProcessor
 
+import llava_anything.training as training_module
 from llava_anything.builder import save_from_yaml
 from llava_anything.training import (
     IGNORE_INDEX,
@@ -42,6 +46,157 @@ def _write_pretrain_json(path: Path, image_name: str) -> None:
             ]
         )
     )
+
+
+def test_pretrain_dataset_reads_huggingface_dataset_images(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tiny_model_yaml_path: Path,
+    tiny_full_model_dir: Path,
+    tiny_image,
+) -> None:
+    save_from_yaml(tiny_model_yaml_path, tiny_full_model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(tiny_full_model_dir)
+    image_buffer = BytesIO()
+    tiny_image.save(image_buffer, format="PNG")
+    records = [
+        {
+            "id": "decoded-image",
+            "image": tiny_image.copy(),
+            "conversations": [
+                {"from": "human", "value": "<image>\nWhat is shown?"},
+                {"from": "gpt", "value": "decoded"},
+            ],
+        },
+        {
+            "id": "bytes-image",
+            "image": {"bytes": image_buffer.getvalue(), "path": "sample.png"},
+            "conversations": [
+                {"from": "human", "value": "<image>\nWhat is shown?"},
+                {"from": "gpt", "value": "bytes"},
+            ],
+        },
+    ]
+    calls = []
+
+    class FakeHFDataset:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __len__(self):
+            return len(self.rows)
+
+        def select(self, indices):
+            return FakeHFDataset([self.rows[index] for index in indices])
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    def fake_load_dataset(path, name=None, split=None, **kwargs):
+        calls.append((path, name, split, kwargs))
+        return FakeHFDataset(records)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(load_dataset=fake_load_dataset),
+    )
+
+    dataset = LlavaPretrainDataset(
+        hf_dataset_path="naufalso/LLaVA-Pretrain",
+        hf_dataset_name="pretrain",
+        hf_dataset_split="train",
+        image_folder=None,
+        processor=processor,
+        max_samples=2,
+    )
+
+    assert calls == [("naufalso/LLaVA-Pretrain", "pretrain", "train", {})]
+    assert [record["id"] for record in dataset.records] == ["decoded-image", "bytes-image"]
+    assert dataset[0]["pixel_values"].shape == (3, 8, 8)
+    assert dataset[1]["pixel_values"].shape == (3, 8, 8)
+
+
+def test_pretraining_yaml_passes_huggingface_dataset_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_dataset_kwargs = {}
+    output_dir = tmp_path / "out"
+    training_yaml = tmp_path / "train.yaml"
+    training_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "model_checkpoint": "checkpoint",
+                "data": {
+                    "hf_dataset_path": "naufalso/LLaVA-Pretrain",
+                    "hf_dataset_name": "pretrain",
+                    "hf_dataset_split": "train",
+                    "max_samples": 4,
+                },
+                "training": {
+                    "output_dir": str(output_dir),
+                    "max_steps": 0,
+                    "report_to": [],
+                    "remove_unused_columns": False,
+                },
+            }
+        )
+    )
+
+    class FakeModel:
+        def __init__(self):
+            self.config = SimpleNamespace(use_cache=True)
+            self.language_model = SimpleNamespace(config=SimpleNamespace(use_cache=True))
+
+        def named_parameters(self):
+            return []
+
+        def save_pretrained(self, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    class FakeProcessor:
+        tokenizer = SimpleNamespace()
+
+        def save_pretrained(self, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    class FakeDataset:
+        pass
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def train(self, resume_from_checkpoint=None):
+            return SimpleNamespace(training_loss=0.0)
+
+    def fake_dataset(**kwargs):
+        captured_dataset_kwargs.update(kwargs)
+        return FakeDataset()
+
+    fake_training_args = SimpleNamespace(output_dir=str(output_dir), resume_from_checkpoint=False)
+    monkeypatch.setattr(
+        training_module,
+        "_load_checkpoint_model_and_processor",
+        lambda *args, **kwargs: (FakeModel(), FakeProcessor()),
+    )
+    monkeypatch.setattr(training_module, "apply_trainable_modules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(training_module, "apply_frozen_parameter_patterns", lambda *args, **kwargs: [])
+    monkeypatch.setattr(training_module, "LlavaPretrainDataset", fake_dataset)
+    monkeypatch.setattr(training_module, "LlavaPretrainDataCollator", lambda *args, **kwargs: object())
+    monkeypatch.setattr(training_module, "_coerce_training_arguments", lambda *args, **kwargs: fake_training_args)
+    monkeypatch.setattr(training_module, "_resolve_resume_from_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(training_module, "LlavaAnythingTrainer", FakeTrainer)
+
+    training_module.run_pretraining_from_yaml(training_yaml)
+
+    assert captured_dataset_kwargs["data_path"] is None
+    assert captured_dataset_kwargs["image_folder"] is None
+    assert captured_dataset_kwargs["hf_dataset_path"] == "naufalso/LLaVA-Pretrain"
+    assert captured_dataset_kwargs["hf_dataset_name"] == "pretrain"
+    assert captured_dataset_kwargs["hf_dataset_split"] == "train"
+    assert captured_dataset_kwargs["max_samples"] == 4
 
 
 def test_pretrain_dataset_reads_llava_json_and_masks_prompt_tokens(

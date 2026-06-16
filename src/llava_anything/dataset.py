@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import json
 import os
 import time
@@ -88,6 +89,75 @@ def _load_json_records(path: str | Path, max_samples: int | None = None) -> list
             records = json.load(handle)
     if not isinstance(records, list):
         raise ValueError(f"Expected a list of records in {path}")
+    return records
+
+
+def _load_datasets_module() -> Any:
+    """Import Hugging Face Datasets only when an HF dataset source is requested."""
+
+    try:
+        import datasets
+    except ImportError as exc:
+        raise RuntimeError(
+            "Training from Hugging Face datasets requires the 'datasets' package. "
+            "Install the project with an environment that includes datasets."
+        ) from exc
+    return datasets
+
+
+def _load_hf_records(
+    dataset_path: str,
+    dataset_name: str | None = None,
+    split: str = "train",
+    max_samples: int | None = None,
+    revision: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load LLaVA-style records from a Hugging Face Dataset split."""
+
+    datasets = _load_datasets_module()
+    load_kwargs: dict[str, Any] = {"split": split}
+    if revision is not None:
+        load_kwargs["revision"] = revision
+
+    source_label = dataset_path
+    if dataset_name:
+        source_label = f"{source_label}/{dataset_name}"
+    print(f"Loading Hugging Face dataset records from {source_label} split={split!r}")
+    dataset = datasets.load_dataset(dataset_path, name=dataset_name, **load_kwargs)
+
+    if max_samples is not None:
+        max_samples = int(max_samples)
+        if max_samples < 0:
+            raise ValueError("max_samples must be non-negative.")
+        try:
+            sample_count = min(max_samples, len(dataset))
+        except TypeError:
+            sample_count = max_samples
+        if hasattr(dataset, "select"):
+            dataset = dataset.select(range(sample_count))
+
+    total = None
+    try:
+        total = len(dataset)
+    except TypeError:
+        pass
+
+    records: list[dict[str, Any]] = []
+    iterator = tqdm(
+        dataset,
+        total=total,
+        desc=f"Loading {source_label}",
+        unit=" records",
+        disable=not _is_main_process(),
+        mininterval=10.0,
+    )
+    for row in iterator:
+        if max_samples is not None and len(records) >= max_samples:
+            break
+        if isinstance(row, dict):
+            records.append(dict(row))
+        else:
+            records.append(dict(row))
     return records
 
 
@@ -210,9 +280,9 @@ class LlavaPretrainDataset(Dataset):
 
     def __init__(
         self,
-        data_path: str | Path,
-        image_folder: str | Path,
-        processor: LlavaAnythingProcessor,
+        data_path: str | Path | None = None,
+        image_folder: str | Path | None = None,
+        processor: LlavaAnythingProcessor | None = None,
         max_samples: int | None = None,
         available_images_only: bool = True,
         available_images_cache_dir: str | Path | None = None,
@@ -229,11 +299,26 @@ class LlavaPretrainDataset(Dataset):
         image_token_mismatch_num_workers: int | None = None,
         system_prompt: str | None = None,
         model_max_length: int | None = None,
+        hf_dataset_path: str | None = None,
+        hf_dataset_name: str | None = None,
+        hf_dataset_split: str = "train",
+        hf_dataset_revision: str | None = None,
     ) -> None:
         """Load record metadata and optionally filter examples with missing image files."""
 
-        self.data_path = Path(data_path)
-        self.image_folder = Path(image_folder)
+        if processor is None:
+            raise ValueError("processor is required.")
+        if bool(data_path) == bool(hf_dataset_path):
+            raise ValueError("Exactly one of data_path or hf_dataset_path is required.")
+        if data_path is not None and image_folder is None:
+            raise ValueError("image_folder is required when data_path is used.")
+
+        self.data_path = Path(data_path) if data_path is not None else None
+        self.image_folder = Path(image_folder) if image_folder is not None else None
+        self.hf_dataset_path = str(hf_dataset_path) if hf_dataset_path else None
+        self.hf_dataset_name = hf_dataset_name
+        self.hf_dataset_split = str(hf_dataset_split or "train")
+        self.hf_dataset_revision = hf_dataset_revision
         self.processor = processor
         self.model_max_length = _resolve_model_max_length(processor, model_max_length)
         if system_prompt is not None and not isinstance(system_prompt, str):
@@ -262,7 +347,16 @@ class LlavaPretrainDataset(Dataset):
         if image_token_mismatch_num_workers is None:
             image_token_mismatch_num_workers = self.available_images_num_workers
         self.image_token_mismatch_num_workers = max(0, int(image_token_mismatch_num_workers))
-        records = _load_json_records(self.data_path, max_samples)
+        if self.hf_dataset_path:
+            records = _load_hf_records(
+                self.hf_dataset_path,
+                dataset_name=self.hf_dataset_name,
+                split=self.hf_dataset_split,
+                max_samples=max_samples,
+                revision=self.hf_dataset_revision,
+            )
+        else:
+            records = _load_json_records(self.data_path, max_samples)
         if self.require_image:
             original_count = len(records)
             records = [record for record in records if self._record_has_image(record)]
@@ -319,23 +413,58 @@ class LlavaPretrainDataset(Dataset):
     def _record_image_path(self, record: dict[str, Any]) -> Path:
         """Resolve a record's image path relative to the dataset image folder."""
 
-        image_name = record.get("image")
-        if not image_name:
-            raise ValueError("Pretraining records must include an image path.")
-        return self.image_folder / str(image_name)
+        image_path = self._record_image_path_or_none(record)
+        if image_path is not None:
+            return image_path
+        fallback = record.get("image_path")
+        if fallback:
+            return Path(str(fallback))
+        return Path("<in-memory-image>")
+
+    def _record_image_path_or_none(self, record: dict[str, Any]) -> Path | None:
+        """Resolve an image path when the record image value is path-backed."""
+
+        image_value = record.get("image")
+        raw_path: Any | None = None
+        if isinstance(image_value, (str, Path)):
+            raw_path = image_value
+        elif isinstance(image_value, dict):
+            raw_path = image_value.get("path")
+        elif isinstance(image_value, Image.Image):
+            raw_path = getattr(image_value, "filename", None) or None
+
+        if not raw_path:
+            return None
+
+        path = Path(str(raw_path))
+        if path.is_absolute() or self.image_folder is None:
+            return path
+        return self.image_folder / path
 
     def _record_has_image(self, record: dict[str, Any]) -> bool:
         """Return whether a record declares an image input."""
 
-        return bool(record.get("image"))
+        image_value = record.get("image")
+        if image_value is None:
+            return False
+        if isinstance(image_value, str):
+            return bool(image_value)
+        if isinstance(image_value, dict):
+            return bool(image_value.get("bytes") is not None or image_value.get("path"))
+        return True
 
     def _record_has_available_image(self, record: dict[str, Any]) -> bool:
         """Return whether a record points to an existing image file."""
 
-        image_name = record.get("image")
-        if not image_name:
+        if not self._record_has_image(record):
             return False
-        return (self.image_folder / str(image_name)).is_file()
+        image_value = record.get("image")
+        if isinstance(image_value, Image.Image):
+            return True
+        if isinstance(image_value, dict) and image_value.get("bytes") is not None:
+            return True
+        image_path = self._record_image_path_or_none(record)
+        return image_path is not None and image_path.is_file()
 
     def _record_is_available(self, record: dict[str, Any]) -> bool:
         """Return whether a record should be kept after image availability filtering."""
@@ -368,24 +497,37 @@ class LlavaPretrainDataset(Dataset):
     def _available_images_cache_metadata(self, record_count: int) -> dict[str, Any]:
         """Build cache metadata that ties skipped indices to this dataset input."""
 
-        try:
-            data_stat = self.data_path.stat()
-            data_size = data_stat.st_size
-            data_mtime_ns = data_stat.st_mtime_ns
-        except OSError:
-            data_size = None
-            data_mtime_ns = None
+        data_size = None
+        data_mtime_ns = None
+        if self.data_path is not None:
+            try:
+                data_stat = self.data_path.stat()
+                data_size = data_stat.st_size
+                data_mtime_ns = data_stat.st_mtime_ns
+            except OSError:
+                pass
 
-        return {
+        metadata = {
             "version": 1,
-            "data_path": str(self.data_path.resolve()),
+            "data_path": str(self.data_path.resolve()) if self.data_path is not None else f"hf://{self.hf_dataset_path}",
             "data_size": data_size,
             "data_mtime_ns": data_mtime_ns,
-            "image_folder": str(self.image_folder.resolve()),
+            "image_folder": str(self.image_folder.resolve()) if self.image_folder is not None else None,
             "max_samples": self.max_samples,
             "require_image": self.require_image,
             "record_count": record_count,
         }
+        if self.hf_dataset_path:
+            metadata.update(
+                {
+                    "data_source": "huggingface",
+                    "hf_dataset_path": self.hf_dataset_path,
+                    "hf_dataset_name": self.hf_dataset_name,
+                    "hf_dataset_split": self.hf_dataset_split,
+                    "hf_dataset_revision": self.hf_dataset_revision,
+                }
+            )
+        return metadata
 
     def _image_token_mismatch_cache_metadata(self, record_count: int) -> dict[str, Any]:
         """Build cache metadata for image-token mismatch pre-filtering."""
@@ -795,7 +937,18 @@ class LlavaPretrainDataset(Dataset):
     def _record_image_size(self, record: dict[str, Any]) -> list[int]:
         """Read a record image's original [height, width] without full preprocessing."""
 
-        image_path = self._record_image_path(record)
+        image_value = record.get("image")
+        if isinstance(image_value, Image.Image):
+            width, height = image_value.size
+            return [height, width]
+        if isinstance(image_value, dict) and image_value.get("bytes") is not None:
+            with Image.open(BytesIO(image_value["bytes"])) as image:
+                width, height = image.size
+            return [height, width]
+
+        image_path = self._record_image_path_or_none(record)
+        if image_path is None:
+            raise ValueError("Pretraining records must include a path-backed or in-memory image.")
         with Image.open(image_path) as image:
             width, height = image.size
         return [height, width]
@@ -803,7 +956,15 @@ class LlavaPretrainDataset(Dataset):
     def _load_image(self, record: dict[str, Any]) -> Image.Image:
         """Load a record image as RGB PIL data."""
 
-        image_path = self._record_image_path(record)
+        image_value = record.get("image")
+        if isinstance(image_value, Image.Image):
+            return image_value.convert("RGB")
+        if isinstance(image_value, dict) and image_value.get("bytes") is not None:
+            return Image.open(BytesIO(image_value["bytes"])).convert("RGB")
+
+        image_path = self._record_image_path_or_none(record)
+        if image_path is None:
+            raise ValueError("Pretraining records must include a path-backed or in-memory image.")
         return Image.open(image_path).convert("RGB")
 
     def _has_image_constraints(self) -> bool:

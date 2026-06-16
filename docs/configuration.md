@@ -104,6 +104,18 @@ training:
   remove_unused_columns: false
 ```
 
+For Hugging Face Datasets, replace the local JSON fields with a Hub source:
+
+```yaml
+data:
+  hf_dataset_path: naufalso/LLaVA-Pretrain
+  hf_dataset_name: pretrain
+  hf_dataset_split: train
+```
+
+`image_folder` is only needed for HF datasets whose `image` values are relative
+paths rather than decoded or embedded image records.
+
 Stage 2 usually starts from a checkpoint and trains more modules:
 
 ```yaml

@@ -18,3 +18,4 @@ output/
 .venv*
 scripts/sbatch/*
 playgrounds/
+configs/eval/*

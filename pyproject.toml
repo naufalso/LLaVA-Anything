@@ -27,6 +27,7 @@ dependencies = [
     "torchvision",
     "transformers>=5.8.1",
     "huggingface-hub>=0.34",
+    "datasets>=2.16",
     "pillow>=10",
     "pyyaml>=6",
 ]
