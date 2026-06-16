@@ -457,6 +457,65 @@ def test_pretrain_dataset_lazily_skips_invalid_image_token_records_by_default(
     assert int((sample["input_ids"] == image_token_id).sum().item()) == 10
 
 
+def test_pretrain_dataset_lazily_skips_text_only_records_with_image_token(
+    tmp_path: Path,
+    tiny_text_component_dir: Path,
+    tiny_vision_component_dir: Path,
+) -> None:
+    model_yaml = tmp_path / "anyres-model.yaml"
+    model_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "image_token": "<image>",
+                    "image_token_index": 63,
+                    "projector_type": "linear",
+                    "vision_feature_layer": -1,
+                    "vision_feature_select_strategy": "default",
+                },
+                "image": {
+                    "mode": "anyres",
+                    "anyres": {"enabled": True, "grid_pinpoints": [[8, 8], [8, 16]]},
+                },
+                "text_model": {"name_or_path": str(tiny_text_component_dir), "tokenizer": {}},
+                "vision_model": {"name_or_path": str(tiny_vision_component_dir), "image_processor": {"patch_size": 4}},
+            }
+        )
+    )
+    model_dir = tmp_path / "anyres-model"
+    save_from_yaml(model_yaml, model_dir, load_pretrained_components=True)
+    processor = AutoProcessor.from_pretrained(model_dir)
+    data_path = tmp_path / "anyres.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "malformed-text",
+                    "conversations": [
+                        {"from": "human", "value": "Describe this.\n<image>"},
+                        {"from": "gpt", "value": "bad"},
+                    ],
+                },
+                {
+                    "id": "usable-text",
+                    "conversations": [
+                        {"from": "human", "value": "Say hello"},
+                        {"from": "gpt", "value": "hello"},
+                    ],
+                },
+            ]
+        )
+    )
+
+    dataset = LlavaPretrainDataset(data_path=data_path, image_folder=tmp_path, processor=processor)
+    with pytest.warns(UserWarning, match="text-only record.*image token"):
+        sample = dataset[0]
+
+    assert sample["_metadata"]["record_id"] == "usable-text"
+    assert "pixel_values" not in sample
+    assert int((sample["labels"] != IGNORE_INDEX).sum().item()) > 0
+
+
 def test_pretrain_dataset_truncates_without_dropping_all_targets(
     tmp_path: Path,
     tiny_text_component_dir: Path,

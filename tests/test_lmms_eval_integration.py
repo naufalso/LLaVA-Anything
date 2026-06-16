@@ -163,6 +163,7 @@ def test_parrot_lmms_adapter_builds_model_and_batches_generation(monkeypatch) ->
         dtype = torch.float32
 
         def __init__(self) -> None:
+            self.config = SimpleNamespace(tokenizer_padding_side="right")
             self.generate_calls = []
 
         def to(self, device):
@@ -284,6 +285,7 @@ def test_parrot_lmms_adapter_builds_model_and_batches_generation(monkeypatch) ->
         "<image>\nWhat option is second?",
     ]
     assert len(fake_model.generate_calls) == 1
+    assert fake_model.config.tokenizer_padding_side == "left"
     assert fake_model.generate_calls[0]["input_ids"].shape == (2, 2)
     assert fake_model.generate_calls[0]["attention_mask"].shape == (2, 2)
     assert fake_model.generate_calls[0]["max_new_tokens"] == 5

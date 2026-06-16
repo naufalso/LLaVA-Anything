@@ -1197,6 +1197,16 @@ class LlavaPretrainDataset(Dataset):
             stacklevel=2,
         )
 
+    def _warn_text_only_image_token_skip(self, record: dict[str, Any]) -> None:
+        """Warn when a text-only record contains the multimodal placeholder."""
+
+        record_id = record.get("id", "<unknown>")
+        warnings.warn(
+            f"Skipping text-only record because it contains the image token: record_id={record_id!r}.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     def _sample_metadata(self, index: int, record: dict[str, Any]) -> dict[str, Any]:
         """Return compact source metadata for diagnostics outside model forward."""
 
@@ -1218,7 +1228,8 @@ class LlavaPretrainDataset(Dataset):
         has_image = self._record_has_image(record)
         image_token = self.processor.image_token
         if not has_image and image_token in full_text:
-            raise ValueError("Text-only records must not contain the image token.")
+            self._warn_text_only_image_token_skip(record)
+            return None
 
         image = self._load_image(record) if has_image else None
         if image is not None and not self._record_satisfies_image_constraints(record, image):
