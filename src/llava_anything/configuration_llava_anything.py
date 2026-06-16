@@ -31,6 +31,8 @@ class LlavaAnythingConfig(PretrainedConfig):
         vision_feature_select_strategy: str = "default",
         image_seq_length: int | None = None,
         num_additional_image_tokens: int = 1,
+        image_mode: str = "fixed",
+        image_grid_pinpoints: list[list[int]] | None = None,
         text_model_name_or_path: str | None = None,
         vision_model_name_or_path: str | None = None,
         trust_remote_code: bool = False,
@@ -38,6 +40,8 @@ class LlavaAnythingConfig(PretrainedConfig):
         vision_trust_remote_code: bool | None = None,
         **kwargs: Any,
     ) -> None:
+        """Initialize nested text/vision configs and multimodal connector settings."""
+
         super().__init__(**kwargs)
 
         self.text_config = self._coerce_config(text_config, default_model_type="llama")
@@ -49,8 +53,12 @@ class LlavaAnythingConfig(PretrainedConfig):
         self.projector_hidden_act = projector_hidden_act
         self.vision_feature_layer = vision_feature_layer
         self.vision_feature_select_strategy = vision_feature_select_strategy
+        if image_mode not in {"fixed", "anyres"}:
+            raise ValueError(f"image_mode must be 'fixed' or 'anyres', got {image_mode!r}.")
         self.image_seq_length = image_seq_length
         self.num_additional_image_tokens = num_additional_image_tokens
+        self.image_mode = image_mode
+        self.image_grid_pinpoints = image_grid_pinpoints
 
         self.text_model_name_or_path = text_model_name_or_path
         self.vision_model_name_or_path = vision_model_name_or_path
@@ -66,6 +74,8 @@ class LlavaAnythingConfig(PretrainedConfig):
         config: dict[str, Any] | PretrainedConfig | None,
         default_model_type: str,
     ) -> PretrainedConfig:
+        """Convert a dict or missing config into a concrete Transformers config."""
+
         if isinstance(config, PretrainedConfig):
             return config
         if config is None:
@@ -88,9 +98,13 @@ class LlavaAnythingConfig(PretrainedConfig):
         vision_config: PretrainedConfig,
         **kwargs: Any,
     ) -> "LlavaAnythingConfig":
+        """Build a LLaVa-Anything config from existing text and vision configs."""
+
         return cls(text_config=text_config, vision_config=vision_config, **kwargs)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the composite config with nested text and vision config dictionaries."""
+
         output = super().to_dict()
         output["text_config"] = self.text_config.to_dict()
         output["vision_config"] = self.vision_config.to_dict()
@@ -98,4 +112,3 @@ class LlavaAnythingConfig(PretrainedConfig):
 
 
 __all__ = ["LlavaAnythingConfig"]
-

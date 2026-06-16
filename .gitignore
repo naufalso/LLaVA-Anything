@@ -1,5 +1,6 @@
 .venv/
 .pytest_cache/
+.cache/
 __pycache__/
 *.py[cod]
 .DS_Store
@@ -9,4 +10,11 @@ build/
 LLaVA-NeXT/
 data/
 wandb/
+models/
 checkpoints/
+logs/
+output/
+.env
+.venv*
+scripts/sbatch/*
+playgrounds/

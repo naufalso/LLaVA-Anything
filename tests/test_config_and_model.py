@@ -4,7 +4,7 @@ import torch
 from transformers import AutoModelForImageTextToText, CLIPVisionConfig, LlamaConfig
 
 from llava_anything import LlavaAnythingConfig, LlavaAnythingForConditionalGeneration
-from llava_anything.modeling_llava_anything import _default_return_dict_from_config
+from llava_anything.modeling_llava_anything import _default_return_dict_from_config, _format_component_load_report
 
 
 def tiny_config() -> LlavaAnythingConfig:
@@ -47,6 +47,15 @@ def test_config_round_trips_nested_configs() -> None:
     assert restored.image_seq_length == 4
 
 
+
+def anyres_tiny_config() -> LlavaAnythingConfig:
+    config = tiny_config()
+    config.image_seq_length = None
+    config.image_mode = "anyres"
+    config.image_grid_pinpoints = [[8, 8], [8, 16], [16, 8]]
+    return config
+
+
 def test_forward_replaces_image_placeholders() -> None:
     torch.manual_seed(0)
     model = LlavaAnythingForConditionalGeneration(tiny_config())
@@ -58,6 +67,57 @@ def test_forward_replaces_image_placeholders() -> None:
 
     assert outputs.logits.shape == (1, 6, 64)
     assert outputs.image_hidden_states.shape == (1, 4, 16)
+
+
+
+def test_anyres_forward_packs_square_image_features() -> None:
+    torch.manual_seed(0)
+    model = LlavaAnythingForConditionalGeneration(anyres_tiny_config())
+    input_ids = torch.tensor([[1, *([63] * 10), 2]])
+    pixel_values = torch.randn(1, 2, 3, 8, 8)
+    image_sizes = torch.tensor([[8, 8]])
+
+    outputs = model(input_ids=input_ids, pixel_values=pixel_values, image_sizes=image_sizes)
+
+    assert outputs.logits.shape == (1, 12, 64)
+    assert outputs.image_hidden_states.shape == (10, 16)
+
+
+def test_anyres_forward_packs_multiple_image_sizes() -> None:
+    torch.manual_seed(0)
+    model = LlavaAnythingForConditionalGeneration(anyres_tiny_config())
+    input_ids = torch.tensor([[1, *([63] * 10), 2, *([63] * 14), 3]])
+    pixel_values = torch.randn(2, 3, 3, 8, 8)
+    image_sizes = torch.tensor([[8, 8], [8, 16]])
+
+    outputs = model(input_ids=input_ids, pixel_values=pixel_values, image_sizes=image_sizes)
+
+    assert outputs.logits.shape == (1, 27, 64)
+    assert outputs.image_hidden_states.shape == (24, 16)
+
+
+def test_component_load_report_uses_plain_language_for_ignored_clip_keys() -> None:
+    report = _format_component_load_report(
+        component_name="vision tower",
+        model_name_or_path="openai/clip-vit-base-patch32",
+        loading_info={
+            "missing_keys": [],
+            "unexpected_keys": [
+                "text_model.encoder.layers.0.layer_norm1.bias",
+                "text_model.encoder.layers.1.layer_norm1.bias",
+                "logit_scale",
+                "text_projection.weight",
+                "visual_projection.weight",
+            ],
+            "mismatched_keys": [],
+            "error_msgs": [],
+        },
+    )
+
+    assert report is not None
+    assert "ignored checkpoint weights" in report
+    assert "UNEXPECTED" not in report
+    assert "expected when loading only the vision encoder from a CLIP-style checkpoint" in report
 
 
 def test_default_return_dict_prefers_modern_config_attribute() -> None:

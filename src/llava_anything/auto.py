@@ -10,6 +10,8 @@ from .processing_llava_anything import LlavaAnythingProcessor
 
 
 def _register(registry, *args) -> None:
+    """Register an Auto class mapping while tolerating older Transformers APIs."""
+
     try:
         registry.register(*args, exist_ok=True)
     except TypeError:
@@ -20,6 +22,8 @@ def _register(registry, *args) -> None:
 
 
 def register_auto_classes() -> None:
+    """Register LLaVa-Anything config, model, and processor with Transformers Auto classes."""
+
     _register(AutoConfig, LlavaAnythingConfig.model_type, LlavaAnythingConfig)
 
     try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -36,6 +37,49 @@ def test_processor_expands_single_image_token() -> None:
     expanded = processor._expand_image_tokens("<image>\nhello")
 
     assert expanded == "<image><image><image>\nhello"
+
+
+def test_anyres_processor_expands_square_wide_and_tall_images() -> None:
+    tok = tokenizer()
+    tok.pad_token = "<unk>"
+    processor = LlavaAnythingProcessor(
+        image_processor=CLIPImageProcessor(size={"height": 8, "width": 8}, crop_size={"height": 8, "width": 8}),
+        tokenizer=tok,
+        image_token="<image>",
+        patch_size=4,
+        image_mode="anyres",
+        image_grid_pinpoints=[[8, 8], [8, 16], [16, 8]],
+    )
+    images = [
+        Image.new("RGB", (8, 8)),
+        Image.new("RGB", (16, 8)),
+        Image.new("RGB", (8, 16)),
+    ]
+
+    batch = processor(images=images, text=["<image>", "<image>", "<image>"], return_tensors="pt", padding=True)
+
+    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    assert batch["image_sizes"].tolist() == [[8, 8], [8, 16], [16, 8]]
+    assert batch["pixel_values"].shape == (3, 3, 3, 8, 8)
+    assert (batch["input_ids"] == image_token_id).sum(dim=1).tolist() == [10, 14, 16]
+
+
+def test_anyres_processor_handles_multiple_image_sizes_in_one_prompt() -> None:
+    processor = LlavaAnythingProcessor(
+        image_processor=CLIPImageProcessor(size={"height": 8, "width": 8}, crop_size={"height": 8, "width": 8}),
+        tokenizer=tokenizer(),
+        image_token="<image>",
+        patch_size=4,
+        image_mode="anyres",
+        image_grid_pinpoints=[[8, 8], [8, 16]],
+    )
+    images = [Image.new("RGB", (8, 8)), Image.new("RGB", (16, 8))]
+
+    batch = processor(images=images, text="<image> hello <image>", return_tensors="pt")
+
+    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    assert batch["image_sizes"].tolist() == [[8, 8], [8, 16]]
+    assert int((batch["input_ids"] == image_token_id).sum().item()) == 24
 
 
 def test_apply_chat_template_normalizes_multimodal_content() -> None:

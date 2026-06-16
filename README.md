@@ -1,104 +1,123 @@
-# LLaVa-Anything
+# LLaVA-Anything
 
-**Build LLaVA-style vision-language models from Hugging Face language and vision models.**
+Build LLaVA-style vision-language models from the Hugging Face models you
+already know.
 
-LLaVa-Anything is a Hugging Face-native project for composing vision-language
-models from standard Transformers components. Define a base causal LLM, a vision
-encoder, and a multimodal projector in YAML, then build a model that can be used
-with familiar Hugging Face `AutoProcessor` and `AutoModelForImageTextToText`
-APIs.
+LLaVA-Anything is a small, composable framework for turning a causal language
+model plus a vision encoder into a multimodal model. You describe the pieces in
+YAML, train the projector or the full model when you are ready, and save
+artifacts that load through familiar Transformers APIs.
 
-The goal is to make VLM experimentation easier when you want to try a new
-Hugging Face LLM that is not already supported by an existing LLaVA
-implementation. Instead of starting from a large fork and tracing model-specific
-changes across the codebase, LLaVa-Anything keeps the composition layer small,
-explicit, and reusable.
+The project is for researchers, builders, and open-source teams who want a
+clear starting point for their own VLM or MLLM without maintaining a large
+model-family-specific fork.
 
-## Why This Project?
+## Why This Exists
 
-LLaVA has made multimodal LLM research much more accessible, but adapting the
-framework to a new language model can still take a lot of custom glue code. This
-project explores a cleaner path: keep the text model, vision tower, projector,
-and processor as independent pieces, then connect them through a shared
-Hugging Face-style interface.
+Many multimodal projects are tightly coupled to a small set of language models,
+vision towers, datasets, and launch environments. That is useful for reproducing
+a paper, but it can be difficult when you want to try a different LLM, swap the
+vision tower, train on your own data, or package the result for other users.
 
-The first version is intentionally practical. It focuses on image-text models,
-YAML-based configuration, Hugging Face save/load behavior, and projector
-training before expanding into broader model support.
+LLaVA-Anything keeps the core idea explicit:
 
-## What It Supports Today
+- choose a Hugging Face causal LLM
+- choose a Hugging Face vision encoder
+- connect them with a multimodal projector
+- train with LLaVA-style image and conversation data
+- load the result with Hugging Face `Auto*` classes
 
-- YAML configs for choosing the language model, vision tower, projector, and
-  processor behavior.
-- A shared LLaVA-style model wrapper built from Transformers components.
-- Hugging Face `AutoConfig`, `AutoProcessor`, and
-  `AutoModelForImageTextToText` loading.
-- CLIP and SigLIP-style vision towers.
-- Stage-1 projector pretraining with frozen LLM and vision tower.
-- Stage-2 full model finetuning.
-- Validation scripts for component loading and image-text smoke tests.
+## What You Can Do
 
-Initial target LLMs:
+- Build model configs and processors from YAML.
+- Assemble full checkpoints from pretrained text and vision components.
+- Use fixed-token image handling or LLaVA-NeXT-style any-resolution image
+  packing.
+- Train a projector-only Stage 1 model, then optionally finetune the full
+  multimodal model.
+- Run single-image or JSON/JSONL batch inference.
+- Evaluate saved checkpoints through the built-in `lmms-eval` adapter, with
+  guidance for other evaluation frameworks.
 
-- `swiss-ai/Apertus-8B-Instruct-2509`
-- `Qwen/Qwen3-8B`
-- `Qwen/Qwen3-1.7B` for lower-memory validation
+## Installation
 
-Initial target vision towers:
-
-- CLIP-style Transformers vision models
-- SigLIP-style Transformers vision models
-
-## How It Works
-
-A model is assembled from four parts:
-
-- a Hugging Face causal language model
-- a Hugging Face vision encoder
-- a multimodal projector
-- a processor that prepares image-text prompts
-
-The YAML builder creates the config and processor artifacts for this composed
-model. You can save only the config/processor for later loading, or save a full
-local checkpoint with pretrained language and vision weights.
-
-## Install
+LLaVA-Anything supports Python 3.10, 3.11, and 3.12.
 
 ```bash
-uv venv .venv
-uv pip install -e ".[dev]"
+git clone https://github.com/naufalso/LLaVa-Anything.git
+cd LLaVa-Anything
+
+python -m venv llava-anything-env
+source llava-anything-env/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-## Build From YAML
+Install optional extras only when you need them:
 
 ```bash
-uv run llava-anything-build examples/qwen3_clip.yaml --output-dir checkpoints/qwen3-clip-vlm
+python -m pip install -e ".[dev]"        # tests and development
+python -m pip install -e ".[wandb]"      # Weights & Biases logging
+python -m pip install -e ".[deepspeed]"  # DeepSpeed training support
+python -m pip install -e ".[eval]"       # lmms-eval integration
 ```
 
-This creates a config and processor. Pass `--load-pretrained-components` when
-you want to materialize the base LLM and vision weights locally before saving:
+For GPU training or inference, install the PyTorch build that matches your CUDA
+or accelerator environment before installing the project.
+
+See [Installation](docs/installation.md) for more detail.
+
+## Quick Start
+
+Build a starter model artifact from YAML:
 
 ```bash
-uv run llava-anything-build examples/qwen3_clip.yaml \
-  --output-dir checkpoints/qwen3-clip-full \
+llava-anything-build \
+  examples/qwen3-1.7b/qwen3_1_7b_clip_base.yaml \
+  --output-dir checkpoints/example-vlm
+```
+
+That command creates a Hugging Face-style config and processor. To also load and
+save the pretrained text and vision weights into the output directory, add
+`--load-pretrained-components`:
+
+```bash
+llava-anything-build \
+  examples/qwen3-1.7b/qwen3_1_7b_clip_base.yaml \
+  --output-dir checkpoints/example-vlm-full \
   --load-pretrained-components
 ```
 
-A full saved artifact can be reloaded with `AutoProcessor` and
-`AutoModelForImageTextToText` without calling the YAML builder at inference time.
-Transformers 5.8 stores the image processor payload inside
-`processor_config.json` for this composite processor.
+Run inference after you have a checkpoint with trained multimodal weights:
 
-## Inference
+```bash
+llava-anything-infer checkpoints/example-vlm-full \
+  --image-input examples/image/example-image1.jpg \
+  --prompt "Describe this image."
+```
+
+If the projector has not been trained yet, the model can load successfully but
+its image understanding will not be meaningful. Start with the training guide
+when you are building a new VLM from base components.
+
+## Common Workflows
+
+Train from a YAML recipe:
+
+```bash
+llava-anything-train path/to/training.yaml
+```
+
+Load a saved checkpoint in Python:
 
 ```python
 import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-import llava_anything
+import llava_anything  # registers LLaVA-Anything Auto classes
 
-model_id = "checkpoints/qwen3-clip-vlm"
+model_id = "checkpoints/my-vlm"
 processor = AutoProcessor.from_pretrained(model_id)
 model = AutoModelForImageTextToText.from_pretrained(
     model_id,
@@ -111,7 +130,7 @@ conversation = [
         "role": "user",
         "content": [
             {"type": "image"},
-            {"type": "text", "text": "Describe this image."},
+            {"type": "text", "text": "What is happening in this image?"},
         ],
     }
 ]
@@ -125,141 +144,35 @@ with torch.inference_mode():
 print(processor.decode(output[0], skip_special_tokens=True))
 ```
 
-## Stage-1 Projector Pretraining
-
-Stage-1 follows the LLaVA feature-alignment setup: the language model and
-vision tower are frozen, and only `multi_modal_projector` is trained. The
-training configuration is separate from the model YAML.
-
-First download and extract the LLaVA-Pretrain dataset:
+Evaluate with `lmms-eval` after installing the `eval` extra:
 
 ```bash
-scripts/download_llava_pretrain.sh
+accelerate launch -m lmms_eval \
+  --model llava_anything \
+  --model_args pretrained=checkpoints/my-vlm,dtype=bfloat16,batch_size=1 \
+  --tasks <task_name> \
+  --batch_size 1
 ```
 
-Then start projector pretraining:
+## Documentation
 
-```bash
-uv run llava-anything-train examples/qwen3_1_7b_clip_base_pretrain.yaml
-```
+- [Documentation Home](docs/index.md)
+- [Background and Concepts](docs/background.md)
+- [Installation](docs/installation.md)
+- [Quick Start](docs/quickstart.md)
+- [Configuration](docs/configuration.md)
+- [Training](docs/training.md)
+- [Inference](docs/inference.md)
+- [Evaluation](docs/evaluation.md)
+- [Roadmap](docs/roadmap.md)
+- [Architecture Decision Record](docs/architecture/adr-001-hf-native-composition.md)
 
-`llava-anything-pretrain` is still available as a backward-compatible alias for
-older Stage-1 commands.
+## Project Status
 
-The provided example expects LLaVA-Pretrain annotations at
-`data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json` and images under
-`data/LLaVA-Pretrain`. It uses `examples/qwen3_1_7b_clip_base.yaml`, bfloat16,
-and projector-only training. Set `training.bf16: false` and remove
-`model_kwargs.torch_dtype` if you are doing a tiny CPU-only smoke.
+LLaVA-Anything is early-stage software. The core composition, training, inference,
+and first evaluation adapter are in place, but APIs may still evolve as the
+project adds broader model support, packaging, examples, and evaluation
+integrations.
 
-Set `logging.preview_samples` to print rendered prompt/target examples before
-training starts. Weights & Biases is optional and only activates when the
-training YAML defines a top-level `wandb:` block:
-
-```bash
-uv pip install -e ".[dev,wandb]"
-```
-
-```yaml
-wandb:
-  project: llava-anything
-  name: qwen3-1.7b-clip-base-pretrain-projector
-  mode: offline
-```
-
-## Stage-2 Full Model Finetuning
-
-Stage-2 starts from the Stage-1 projector checkpoint and finetunes the full
-composed model on LLaVA-Instruct data. The dataset is not included in this repo,
-so prepare the instruction JSON and images before running Stage-2.
-
-Stage-2 full finetuning has been completed and tested with
-`examples/qwen3_1_7b_clip_base_stage2_full.yaml` on `qwen3-1.7b-clip-base`.
-
-The Stage-2 configs expect this layout:
-
-```text
-data/LLaVA-Instruct-150K/llava_v1_5_mix665k.json
-data/LLaVA-Instruct-150K/coco/train2017/
-data/LLaVA-Instruct-150K/gqa/images/
-data/LLaVA-Instruct-150K/ocr_vqa/images/
-data/LLaVA-Instruct-150K/textvqa/train_images/
-data/LLaVA-Instruct-150K/vg/VG_100K/
-data/LLaVA-Instruct-150K/vg/VG_100K_2/
-```
-
-Download or place `llava_v1_5_mix665k.json` under `data/LLaVA-Instruct-150K`,
-then download and extract the image datasets:
-
-```bash
-scripts/download_llava_instruct_images.sh
-```
-
-For a short validation run before the full finetune, use the smoke config. It
-reads the same instruction JSON, filters records to images that exist locally,
-and limits the run to a small sample:
-
-```bash
-uv run llava-anything-train examples/qwen3_1_7b_clip_base_stage2_smoke.yaml
-```
-
-After the full dataset is ready, run the full Stage-2 config:
-
-```bash
-uv run llava-anything-train examples/qwen3_1_7b_clip_base_stage2_full.yaml
-```
-
-Both configs expect the Stage-1 checkpoint at
-`checkpoints/qwen3-1.7b-clip-base-pretrain-projector`.
-
-## Validation Scripts
-
-Load real YAML components on a GPU machine:
-
-```bash
-uv run python scripts/validate_gpu_components.py examples/qwen3_clip.yaml
-```
-
-Run a saved-model image-text smoke through Hugging Face Auto APIs:
-
-```bash
-uv run python scripts/smoke_image_text_generation.py checkpoints/qwen3-clip-full --image image.jpg
-```
-
-The projector starts randomly initialized unless you have trained or loaded
-projector weights, so these smokes validate runtime compatibility rather than
-answer quality.
-
-## Current Status
-
-LLaVa-Anything is an alpha project under active development. The main
-composition path is in place, and the first training and validation utilities are
-available. Image understanding quality depends on trained projector or adaptor
-weights, so early smoke tests are mainly used to confirm that the runtime path is
-working.
-
-For the detailed engineering roadmap, see
-[`docs/development/roadmap.md`](docs/development/roadmap.md).
-
-## Roadmap
-
-- [x] Hugging Face-native model and processor composition.
-- [x] YAML-based VLM configuration.
-- [x] Hugging Face Auto API save/load support.
-- [x] CLIP and SigLIP-style vision tower support.
-- [x] Stage-1 projector pretraining.
-- [x] Stage-2 full model finetuning, tested on `qwen3-1.7b-clip-base`.
-- [x] Basic validation and smoke-test scripts.
-- [ ] Broader validation across more LLMs and vision towers.
-- [ ] More ready-to-run example configs.
-- [ ] LLaVA-NeXT-style any-resolution image handling.
-- [ ] More documentation for custom model integration.
-- [ ] Community compatibility reports.
-- [ ] Low priority: publish a unified Hugging Face dataset mirror for training data.
-
-## Contributing
-
-Contributions are welcome, especially around new model compatibility, example
-configs, training recipes, validation results, and documentation. If you try a
-new LLM or vision tower, please share what worked, what failed, and the main
-environment details such as Transformers, PyTorch, CUDA, and GPU version.
+Contributions that improve usability, documentation, model compatibility, test
+coverage, or clean evaluation adapters are especially welcome.

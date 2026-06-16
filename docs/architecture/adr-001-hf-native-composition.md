@@ -6,68 +6,66 @@ Accepted
 
 ## Context
 
-LLaVA-NeXT is used as reference only and will not be included in this project.
-The new project needs to turn Hugging Face Transformers-based causal LLMs into
-LLaVA-style VLMs through YAML configuration. It should support the Hugging Face
-processor/model inference shape used by LLaVA-NeXT, including
-`image-text-to-text` pipelines and AutoModel loading.
+LLaVA-style systems combine a language model, a vision encoder, a projector, and
+a processor contract. Many implementations make that combination work through
+model-family-specific subclasses and local assumptions about datasets or launch
+environments.
 
-The first version targets a small-team research/development workflow, latest
-Transformers, image-text support, and the following initial components:
-
-- LLMs: `swiss-ai/Apertus-8B-Instruct-2509`, `Qwen/Qwen3-8B`
-- vision towers: CLIP and SigLIP-style Transformers vision models
-- adapters: linear and MLP projectors
+LLaVA-Anything needs a smaller and more reusable foundation. The project should
+let users compose compatible Transformers language and vision models, save the
+result as a Hugging Face-style artifact, and load it through standard Auto APIs
+whenever possible.
 
 ## Options Considered
 
-| Option | Pros | Cons | Complexity | When Valid |
-| --- | --- | --- | --- | --- |
-| Keep LLaVA-NeXT class-per-LLM wrappers | Fast reuse of existing code | Does not scale to arbitrary LLMs; keeps name-based branching | Medium | Maintaining a fork of LLaVA-NeXT |
-| Wrap Hugging Face LLaVA-NeXT as-is | Lowest inference risk | Harder to customize adapters and generic LLM loading | Low | Only reproducing LLaVA-NeXT checkpoints |
-| HF-native composition | Aligns with AutoConfig/AutoModel APIs; avoids per-LLM subclasses | Requires careful generation and processor integration | Medium | Building a general package |
+| Option | Pros | Cons | When Valid |
+| --- | --- | --- | --- |
+| Maintain class-per-LLM wrappers | Fast when supporting one known model family | Does not scale well to arbitrary LLMs | A narrow reproduction-focused fork |
+| Wrap an existing LLaVA implementation directly | Low initial implementation cost | Harder to expose generic composition and clean configs | Reproducing existing checkpoints |
+| Build a Hugging Face-native composition layer | Clear component boundaries and reusable artifacts | Requires careful processor and generation integration | A general framework for new VLMs |
 
 ## Decision
 
 Use a Hugging Face-native compositional architecture:
 
-- `LlavaAnythingConfig` stores nested `text_config` and `vision_config`.
+- `LlavaAnythingConfig` stores nested text and vision configs.
 - `LlavaAnythingForConditionalGeneration` composes an
-  `AutoModelForCausalLM` language model, an `AutoModel` vision tower, and a
-  multimodal projector.
+  `AutoModelForCausalLM`, an `AutoModel` vision tower, and a multimodal
+  projector.
 - `LlavaAnythingProcessor` wraps a tokenizer and image processor and expands
-  image placeholders to the expected number of image feature tokens.
-- YAML is compiled into Hugging Face config/processor artifacts.
-- `trust_remote_code` is supported through explicit config/YAML flags where
-  Transformers can resolve the remote model.
+  image placeholders into the visual token layout expected by the model.
+- YAML compiles into Hugging Face config, processor, and optional model
+  artifacts.
+- `trust_remote_code` is explicit in YAML and loading paths.
 
 ## Rationale
 
-This matches the goal of turning any compatible Transformers causal LLM into a
-VLM without adding a new Python subclass for every language model family. It
-also keeps model loading, saving, processor behavior, and pipeline integration
-close to Hugging Face conventions.
+This design keeps the public contract close to Transformers conventions while
+allowing the project to support more language models and vision towers over
+time. It also makes trained checkpoints easier to share because downstream code
+does not need to reconstruct the original YAML recipe.
 
-## Trade-offs
+## Trade-Offs
 
-- The v1 model starts with fixed image-token counts rather than full LLaVA-NeXT
-  any-resolution packing.
-- Remote-code LLMs depend on the base model exposing a compatible
-  `AutoModelForCausalLM` interface.
-- Training scripts are intentionally left as a later layer so the public
-  model/processor contract can stabilize first.
+- Some base models may still need compatibility fixes when their generation or
+  tokenizer behavior differs from common causal LM conventions.
+- Evaluation frameworks with custom registries still need thin adapters.
+- Any-resolution image packing adds complexity to processor behavior, so it
+  needs strong tests and clear configuration docs.
 
 ## Consequences
 
-- Positive: Qwen3, Apertus, and future supported LLMs can share one VLM wrapper.
-- Positive: generated checkpoints can be consumed through Hugging Face Auto APIs.
-- Negative: some custom LLMs may need model-specific compatibility fixes.
-- Mitigation: keep `trust_remote_code` explicit and add small compatibility
-  adapters only when a real target model proves it is needed.
+- Positive: new compatible LLMs and vision towers can share one VLM wrapper.
+- Positive: saved checkpoints can be consumed through Hugging Face Auto APIs.
+- Positive: training, inference, and evaluation docs can describe one common
+  artifact format.
+- Negative: unsupported model families may fail later than a hand-written
+  model-specific wrapper would.
+- Mitigation: keep errors clear, add compatibility tests, and add small adapters
+  only when a real model requires them.
 
 ## Revisit Trigger
 
-Reconsider this decision if Transformers exposes a stable generic multimodal
-composition API that makes this wrapper unnecessary, or if training requirements
-force deep model-family-specific behavior into the core model.
-
+Reconsider this decision if Transformers provides a stable generic multimodal
+composition API that replaces this wrapper, or if supporting important model
+families requires deep model-specific behavior in the core architecture.
