@@ -13,6 +13,9 @@ from .configuration_llava_anything import LlavaAnythingConfig
 from .modeling_llava_anything import LlavaAnythingForConditionalGeneration
 from .processing_llava_anything import LlavaAnythingProcessor
 
+OPEN_CLIP_BACKENDS = {"open_clip", "open-clip"}
+OPEN_CLIP_VISION_MODEL_TYPE = "open_clip_vision_model"
+
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
     """Load a YAML file and require its top-level value to be a mapping."""
@@ -41,6 +44,12 @@ def _extract_vision_config(config: Any) -> Any:
     return config
 
 
+def _is_open_clip_backend(value: Any) -> bool:
+    """Return whether a YAML backend value selects OpenCLIP."""
+
+    return str(value or "").lower() in OPEN_CLIP_BACKENDS
+
+
 def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
     """Construct a model config from a parsed LLaVa-Anything YAML mapping."""
 
@@ -63,9 +72,17 @@ def config_from_yaml_dict(data: dict[str, Any]) -> LlavaAnythingConfig:
     trust_remote_code = bool(model_section.get("trust_remote_code", text_trust_remote_code or vision_trust_remote_code))
 
     text_config = AutoConfig.from_pretrained(text_name, trust_remote_code=text_trust_remote_code)
-    vision_config = _extract_vision_config(
-        AutoConfig.from_pretrained(vision_name, trust_remote_code=vision_trust_remote_code)
-    )
+    if _is_open_clip_backend(vision_section.get("backend")):
+        from .open_clip_vision import config_from_open_clip_config
+
+        vision_config = config_from_open_clip_config(
+            vision_name,
+            pretrained=vision_section.get("pretrained"),
+        )
+    else:
+        vision_config = _extract_vision_config(
+            AutoConfig.from_pretrained(vision_name, trust_remote_code=vision_trust_remote_code)
+        )
 
     image_mode = image_section.get("mode", model_section.get("image_mode", "fixed"))
     if anyres_section.get("enabled") is True:
@@ -144,10 +161,15 @@ def processor_from_yaml_dict(data: dict[str, Any], config: LlavaAnythingConfig) 
     config.image_token_index = int(tokenizer.convert_tokens_to_ids(config.image_token))
     config.vocab_size = int(getattr(config.text_config, "vocab_size", len(tokenizer)) or len(tokenizer))
 
-    image_processor = AutoImageProcessor.from_pretrained(
-        vision_section["name_or_path"],
-        trust_remote_code=config.vision_trust_remote_code,
-    )
+    if getattr(config.vision_config, "model_type", None) == OPEN_CLIP_VISION_MODEL_TYPE:
+        from .open_clip_vision import image_processor_from_open_clip_config
+
+        image_processor = image_processor_from_open_clip_config(config.vision_config, image_processor_section)
+    else:
+        image_processor = AutoImageProcessor.from_pretrained(
+            vision_section["name_or_path"],
+            trust_remote_code=config.vision_trust_remote_code,
+        )
 
     chat_template = tokenizer_section.get("chat_template", getattr(tokenizer, "chat_template", None))
     return LlavaAnythingProcessor(

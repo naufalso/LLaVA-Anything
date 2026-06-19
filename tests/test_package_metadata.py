@@ -11,6 +11,17 @@ def test_accelerate_is_runtime_dependency_for_device_map_auto() -> None:
     assert any(dependency.split(">=", 1)[0] == "accelerate" for dependency in dependencies)
 
 
+def test_openclip_is_optional_dependency() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = pyproject["project"]["dependencies"]
+    optional = pyproject["project"]["optional-dependencies"]
+
+    normalized_required = [dependency.replace("_", "-") for dependency in dependencies]
+    normalized_openclip = [dependency.replace("_", "-") for dependency in optional["openclip"]]
+    assert not any(dependency.startswith("open-clip-torch") for dependency in normalized_required)
+    assert any(dependency.startswith("open-clip-torch") for dependency in normalized_openclip)
+
+
 def test_python_support_is_bounded_to_tested_versions() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 

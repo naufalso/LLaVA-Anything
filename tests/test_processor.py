@@ -158,6 +158,28 @@ def test_auto_processor_reloads_saved_processor(tmp_path) -> None:
     assert reloaded.image_seq_length == 4
 
 
+def test_processor_from_pretrained_accepts_transformers_processor_dict(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "llava_anything.processing_llava_anything.AutoImageProcessor.from_pretrained",
+        lambda pretrained, **kwargs: ("image_processor", pretrained, kwargs),
+    )
+    monkeypatch.setattr(
+        "llava_anything.processing_llava_anything.AutoTokenizer.from_pretrained",
+        lambda pretrained, **kwargs: ("tokenizer", pretrained, kwargs),
+    )
+
+    args = LlavaAnythingProcessor._get_arguments_from_pretrained(
+        "checkpoint",
+        {"processor_class": "LlavaAnythingProcessor"},
+        trust_remote_code=False,
+    )
+
+    assert args == [
+        ("image_processor", "checkpoint", {"trust_remote_code": False}),
+        ("tokenizer", "checkpoint", {"trust_remote_code": False}),
+    ]
+
+
 def test_processor_post_process_image_text_to_text_decodes_tokens() -> None:
     processor = LlavaAnythingProcessor(
         image_processor=DummyImageProcessor(),

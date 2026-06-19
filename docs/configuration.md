@@ -54,6 +54,25 @@ when the base model requires it and you trust the model repository.
 Use a compatible Transformers vision model and image processor. The image
 processor settings should match the selected vision tower.
 
+For OpenCLIP vision towers, set `backend: open_clip`. LLaVA-Anything reads the
+repository's `open_clip_config.json`, builds an OpenCLIP visual tower through
+`open_clip.create_model`, and mirrors the OpenCLIP preprocessing metadata with a
+Transformers `CLIPImageProcessor`.
+
+```yaml
+vision_model:
+  backend: open_clip
+  name_or_path: chs20/fare2-clip
+  image_processor:
+    patch_size: 14
+    num_additional_image_tokens: 1
+```
+
+Install `llava-anything[openclip]` before loading pretrained OpenCLIP
+components. Hub model ids such as `chs20/fare2-clip` are normalized to
+OpenCLIP's `hf-hub:` format automatically; local OpenCLIP directories are
+normalized to `local-dir:`.
+
 ## Any-Resolution Images
 
 Add an `image` section when you want LLaVA-NeXT-style any-resolution packing:

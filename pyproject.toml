@@ -42,6 +42,9 @@ wandb = [
 deepspeed = [
     "deepspeed>=0.19.1",
 ]
+openclip = [
+    "open_clip_torch>=3.3",
+]
 eval = [
     "lmms_eval @ git+https://github.com/naufalso/lmms-eval.git@c772e920e79b2afa3c092b78437edfb3ce399e5f",
 ]

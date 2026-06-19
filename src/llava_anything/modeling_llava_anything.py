@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - older Transformers fallback
 
 from .configuration_llava_anything import LlavaAnythingConfig
 
+OPEN_CLIP_VISION_MODEL_TYPE = "open_clip_vision_model"
+
 
 @dataclass
 class LlavaAnythingCausalLMOutputWithPast(ModelOutput):
@@ -106,6 +108,16 @@ def _format_component_load_report(
         lines.append("Loader messages:")
         lines.extend(_format_key_examples([str(message) for message in error_msgs]))
     return "\n".join(lines)
+
+
+def _vision_tower_from_config(config: Any) -> nn.Module:
+    """Build the configured vision tower backend."""
+
+    if getattr(config, "model_type", None) == OPEN_CLIP_VISION_MODEL_TYPE:
+        from .open_clip_vision import OpenCLIPVisionTower
+
+        return OpenCLIPVisionTower(config)
+    return AutoModel.from_config(config)
 
 
 def _as_image_size(image_size: Any) -> list[int]:
@@ -325,7 +337,7 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
         """Initialize the vision tower, language model, projector, and newline embedding."""
 
         super().__init__(config)
-        self.vision_tower = vision_tower if vision_tower is not None else AutoModel.from_config(config.vision_config)
+        self.vision_tower = vision_tower if vision_tower is not None else _vision_tower_from_config(config.vision_config)
         self.language_model = (
             language_model if language_model is not None else AutoModelForCausalLM.from_config(config.text_config)
         )
@@ -401,24 +413,33 @@ class LlavaAnythingForConditionalGeneration(PreTrainedModel, GenerationMixin):
             resized_vocab_size = language_model.get_input_embeddings().num_embeddings
             config.text_config.vocab_size = resized_vocab_size
             config.vocab_size = resized_vocab_size
-        vision_model_kwargs.setdefault("output_loading_info", True)
-        loaded_vision_tower = AutoModel.from_pretrained(
-            vision_model_name_or_path,
-            config=config.vision_config,
-            trust_remote_code=config.vision_trust_remote_code,
-            **vision_model_kwargs,
-        )
-        if isinstance(loaded_vision_tower, tuple):
-            vision_tower, vision_loading_info = loaded_vision_tower
-            load_report = _format_component_load_report(
-                "vision tower",
+        if getattr(config.vision_config, "model_type", None) == OPEN_CLIP_VISION_MODEL_TYPE:
+            from .open_clip_vision import OpenCLIPVisionTower
+
+            vision_tower = OpenCLIPVisionTower.from_pretrained(
                 vision_model_name_or_path,
-                vision_loading_info,
+                config=config.vision_config,
+                **vision_model_kwargs,
             )
-            if load_report is not None:
-                print(load_report)
         else:
-            vision_tower = loaded_vision_tower
+            vision_model_kwargs.setdefault("output_loading_info", True)
+            loaded_vision_tower = AutoModel.from_pretrained(
+                vision_model_name_or_path,
+                config=config.vision_config,
+                trust_remote_code=config.vision_trust_remote_code,
+                **vision_model_kwargs,
+            )
+            if isinstance(loaded_vision_tower, tuple):
+                vision_tower, vision_loading_info = loaded_vision_tower
+                load_report = _format_component_load_report(
+                    "vision tower",
+                    vision_model_name_or_path,
+                    vision_loading_info,
+                )
+                if load_report is not None:
+                    print(load_report)
+            else:
+                vision_tower = loaded_vision_tower
         return cls(config, language_model=language_model, vision_tower=vision_tower, init_weights=False)
 
     def get_input_embeddings(self) -> nn.Module:

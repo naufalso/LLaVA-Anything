@@ -85,6 +85,10 @@ class LlavaAnythingConfig(PretrainedConfig):
 
         config_dict = dict(config)
         model_type = config_dict.pop("model_type", default_model_type)
+        if model_type == "open_clip_vision_model":
+            from .open_clip_vision import OpenCLIPVisionConfig
+
+            return OpenCLIPVisionConfig(**config_dict)
         try:
             return AutoConfig.for_model(model_type, **config_dict)
         except ValueError:

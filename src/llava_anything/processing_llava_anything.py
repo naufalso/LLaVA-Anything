@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 from PIL import Image
+from transformers import AutoImageProcessor, AutoTokenizer, PreTrainedTokenizerFast
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import select_best_resolution
 from transformers.processing_utils import ProcessorMixin
@@ -13,6 +16,8 @@ from transformers.processing_utils import ProcessorMixin
 
 class LlavaAnythingProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
 
     def __init__(
         self,
@@ -40,6 +45,89 @@ class LlavaAnythingProcessor(ProcessorMixin):
         self.image_mode = image_mode
         self.image_grid_pinpoints = image_grid_pinpoints
         super().__init__(image_processor, tokenizer, chat_template=chat_template, **kwargs)
+
+    @classmethod
+    def _get_arguments_from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Any,
+        processor_dict: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        """Load image and text processors while tolerating converted tokenizer metadata."""
+
+        image_processor = AutoImageProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        tokenizer = cls._load_tokenizer_from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return [image_processor, tokenizer]
+
+    @classmethod
+    def _load_tokenizer_from_pretrained(cls, pretrained_model_name_or_path: Any, **kwargs: Any) -> Any:
+        """Load the tokenizer, falling back for local TokenizersBackend exports."""
+
+        try:
+            return AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        except (AttributeError, ValueError):
+            fallback = cls._load_local_fast_tokenizer(pretrained_model_name_or_path, **kwargs)
+            if fallback is None:
+                raise
+            return fallback
+
+    @staticmethod
+    def _load_local_fast_tokenizer(pretrained_model_name_or_path: Any, **kwargs: Any) -> PreTrainedTokenizerFast | None:
+        """Build a fast tokenizer from files when older Transformers cannot read saved metadata."""
+
+        try:
+            tokenizer_dir = Path(pretrained_model_name_or_path)
+        except TypeError:
+            return None
+
+        subfolder = kwargs.get("subfolder")
+        if subfolder:
+            tokenizer_dir = tokenizer_dir / str(subfolder)
+        tokenizer_json_path = tokenizer_dir / "tokenizer.json"
+        tokenizer_config_path = tokenizer_dir / "tokenizer_config.json"
+        if not tokenizer_dir.is_dir() or not tokenizer_json_path.exists() or not tokenizer_config_path.exists():
+            return None
+
+        with tokenizer_config_path.open("r", encoding="utf-8") as handle:
+            tokenizer_config = json.load(handle)
+
+        extra_special_tokens = tokenizer_config.get("extra_special_tokens")
+        if tokenizer_config.get("tokenizer_class") != "TokenizersBackend" and not isinstance(extra_special_tokens, list):
+            return None
+
+        special_tokens = {}
+        special_tokens_path = tokenizer_dir / "special_tokens_map.json"
+        if special_tokens_path.exists():
+            with special_tokens_path.open("r", encoding="utf-8") as handle:
+                special_tokens = json.load(handle)
+
+        tokenizer_kwargs: dict[str, Any] = {"tokenizer_file": str(tokenizer_json_path)}
+        for token_name in ("bos_token", "eos_token", "unk_token", "pad_token", "sep_token", "cls_token", "mask_token"):
+            token_value = special_tokens.get(token_name, tokenizer_config.get(token_name))
+            if token_value is not None:
+                tokenizer_kwargs[token_name] = token_value
+
+        additional_special_tokens = special_tokens.get("additional_special_tokens")
+        if additional_special_tokens is None and isinstance(extra_special_tokens, list):
+            additional_special_tokens = extra_special_tokens
+        if additional_special_tokens:
+            tokenizer_kwargs["additional_special_tokens"] = additional_special_tokens
+
+        chat_template_path = tokenizer_dir / "chat_template.jinja"
+        if chat_template_path.exists():
+            tokenizer_kwargs["chat_template"] = chat_template_path.read_text(encoding="utf-8")
+        elif tokenizer_config.get("chat_template") is not None:
+            tokenizer_kwargs["chat_template"] = tokenizer_config["chat_template"]
+
+        for key in ("model_max_length", "clean_up_tokenization_spaces"):
+            if tokenizer_config.get(key) is not None:
+                tokenizer_kwargs[key] = tokenizer_config[key]
+
+        tokenizer = PreTrainedTokenizerFast(**tokenizer_kwargs)
+        if tokenizer_config.get("padding_side") is not None:
+            tokenizer.padding_side = tokenizer_config["padding_side"]
+        tokenizer.name_or_path = str(pretrained_model_name_or_path)
+        return tokenizer
 
     @property
     def model_input_names(self) -> list[str]:

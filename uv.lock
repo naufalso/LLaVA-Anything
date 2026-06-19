@@ -856,6 +856,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "datasets" },
     { name = "huggingface-hub" },
     { name = "pillow" },
     { name = "pyyaml" },
@@ -881,6 +882,7 @@ wandb = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
+    { name = "datasets", specifier = ">=2.16" },
     { name = "deepspeed", marker = "extra == 'deepspeed'", specifier = ">=0.19.1" },
     { name = "huggingface-hub", specifier = ">=0.34" },
     { name = "lmms-eval", marker = "extra == 'eval'", git = "https://github.com/naufalso/lmms-eval.git?rev=c772e920e79b2afa3c092b78437edfb3ce399e5f" },
